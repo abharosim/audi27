@@ -46,6 +46,8 @@ CASES = [
     ("do not use Claude Code", "grok", None, False, "default"),
     ("别用 Claude Code，问一下 Muse", "muse", None, False, "rule"),
     ("不要用 Claude Code，用 Muse", "muse", None, False, "rule"),
+    ("别用 Claude Code，用 Grok", "grok", None, False, "rule"),
+    ("别用 Claude Code，用 Grok 查天气", "grok", None, False, "rule"),
     ("don't use Claude Code, ask Muse", "muse", None, False, "rule"),
     ("别用 Grok 查一下", "none", None, False, "rule"),
     ("不要用 Muse 看看面试", "none", None, False, "rule"),

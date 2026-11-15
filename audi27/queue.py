@@ -181,6 +181,10 @@ class ReportQueue:
         if self.inflight is not None:
             self.disposition = "drop"
             return []
+        # A details/pending line is what is being spoken. Skipping it must not
+        # discard the next report, which is still queued behind that line.
+        if self.holding:
+            return []
         if self.items:
             self.items.pop(0)
         return self._drain(allow_deferred=True)
@@ -188,6 +192,8 @@ class ReportQueue:
     def _later(self) -> list[dict]:
         if self.inflight is not None:
             self.disposition = "back"
+            return []
+        if self.holding:
             return []
         if not self.items:
             return []

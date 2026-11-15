@@ -179,6 +179,29 @@ def test_details_speaks_the_full_text_of_the_current_item():
     assert out[0]["data"]["text_ref"] == "a" and out[0]["ref"] == "c"
 
 
+def test_skip_during_details_does_not_drop_the_next_report():
+    queue = ReportQueue()
+    queue.push_all([reply("a", "甲。全文"), reply("b", "乙。")])
+    details = queue.push_all([command("d", "details"), spoken("brief-a")])
+    assert details[0]["data"]["kind"] == "details"
+    assert queue.inflight is None and queue.holding == details[0]["id"]
+    assert queue.push_all([command("s", "skip")]) == []
+    assert [it.id for it in queue.items] == ["b"]
+    nxt = queue.push_all([spoken(details[0]["id"])])
+    assert nxt[0]["data"]["text_ref"] == "b"
+
+
+def test_later_during_pending_does_not_push_back_the_next_report():
+    queue = ReportQueue()
+    queue.push_all([reply("a", "甲。"), reply("b", "乙。")])
+    pending = queue.push_all([command("p", "pending"), spoken("brief-a")])
+    assert pending[0]["data"]["kind"] == "pending"
+    assert queue.push_all([command("c", "later")]) == []
+    assert [it.id for it in queue.items] == ["b"] and queue.items[0].deferred is False
+    nxt = queue.push_all([spoken(pending[0]["id"])])
+    assert nxt[0]["data"]["text_ref"] == "b"
+
+
 def test_details_uses_the_last_item_when_nothing_is_in_flight():
     text = "第一句。第二句全文。"
     queue = ReportQueue()

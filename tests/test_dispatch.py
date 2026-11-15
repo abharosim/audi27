@@ -1,4 +1,5 @@
 """Dispatcher: route in, task and reply out. none/queue/confirmation are not sent."""
+import json
 import threading
 import time
 from pathlib import Path
@@ -6,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from audi27 import config as C
-from audi27.agent import FakeAgent
+from audi27.agent import Agent, FakeAgent, reply_event, task_event
 from audi27.dispatch import dispatch_all, dispatch_one, serve
-from audi27.events import append, make_event, replay
+from audi27.events import append, make_event, replay, snapshot_offsets
 from audi27.supervisor import child_specs
 
 TS = "2026-11-15T12:00:00+00:00"
@@ -91,20 +92,167 @@ def test_dispatcher_skips_none_and_queue_and_holds_confirmation(tmp_path):
     assert len(list(replay(data, types="task"))) == 4
 
 
-def test_a_done_task_without_a_reply_is_sent_again(tmp_path):
-    """A crash between `done` and the reply must not drop the reply on restart."""
+class _Counting(Agent):
+    def __init__(self):
+        self.calls = []
+
+    def handle(self, route, emit):
+        self.calls.append(route["id"])
+
+
+def _rewind_dispatch(data):
+    offs = {name: 0 for name in snapshot_offsets(data)}
+    (Path(data) / "dispatch.cursor.json").write_text(
+        json.dumps({"offsets": offs}), encoding="utf-8")
+
+
+def test_a_done_task_without_a_reply_is_not_sent_again(tmp_path):
+    """The adapter already ran. A missing reply must not run it a second time."""
     data = tmp_path / "data"
-    event = route("route-1", "今天天气怎么样")
-    append(data, event)
+    append(data, route("route-1", "今天天气怎么样"))
     for status, ref in (("sent", "route-1"), ("running", "task-route-1-sent"), ("done", "task-route-1-running")):
         append(data, make_event("task", "dispatch", {
             "route_id": "route-1", "target": "grok", "adapter": "fake",
             "status": status, "text": "今天天气怎么样",
         }, ts=TS, ref=ref, id=f"task-route-1-{status}"))
-    assert dispatch_all(data, C.Config())["wrote"] == 1
-    replies = list(replay(data, types="reply"))
-    assert len(replies) == 1 and replies[0]["ref"] == "task-route-1-done"
-    assert dispatch_all(data, C.Config())["wrote"] == 0
+    agent = _Counting()
+    assert dispatch_all(data, C.Config(), agents={"fake": agent})["wrote"] == 1
+    assert agent.calls == []
+    tasks = list(replay(data, types="task"))
+    assert [ev["data"]["status"] for ev in tasks] == ["sent", "running", "done", "failed"]
+    assert tasks[-1]["data"]["error"]
+    assert list(replay(data, types="reply")) == []
+    assert dispatch_all(data, C.Config(), agents={"fake": agent})["wrote"] == 0
+    assert agent.calls == []
+
+
+def test_a_raising_adapter_fails_once_and_is_not_retried(tmp_path):
+    data = tmp_path / "data"
+    append(data, route("route-1", "你好"))
+
+    class Boom(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            emit(task_event(route, status="sent", ref=route["id"], adapter="fake"))
+            raise RuntimeError("timeout")
+
+    agent = Boom()
+    assert dispatch_all(data, C.Config(), agents={"fake": agent})["wrote"] == 2
+    assert agent.calls == ["route-1"]
+    tasks = list(replay(data, types="task"))
+    assert [ev["data"]["status"] for ev in tasks] == ["sent", "failed"]
+    assert list(replay(data, types="reply")) == []
+    assert dispatch_all(data, C.Config(), agents={"fake": agent})["wrote"] == 0
+    assert agent.calls == ["route-1"]
+
+
+def test_a_reply_may_arrive_after_handle_returns(tmp_path):
+    """A slow adapter can emit the reply after handle returns, without a second call."""
+    data = tmp_path / "data"
+    append(data, route("route-1", "今天天气怎么样"))
+    held = {}
+
+    class Slow(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            sent = task_event(route, status="sent", ref=route["id"], adapter="fake")
+            emit(sent)
+            emit(task_event(route, status="running", ref=sent["id"], adapter="fake"))
+            held["emit"] = emit
+            held["route"] = route
+
+    agent = Slow()
+    assert dispatch_all(data, C.Config(), agents={"fake": agent})["wrote"] == 2
+    assert agent.calls == ["route-1"]
+    assert list(replay(data, types="reply")) == []
+    assert not any(ev["data"]["status"] == "failed" for ev in replay(data, types="task"))
+    done = task_event(held["route"], status="done", ref="task-route-1-running", adapter="fake")
+    held["emit"](done)
+    held["emit"](reply_event(held["route"], ref=done["id"], text="收到：今天天气怎么样",
+                             needs_decision=False, adapter="fake"))
+    assert [ev["data"]["text"] for ev in replay(data, types="reply")] == ["收到：今天天气怎么样"]
+    assert not any(ev["data"]["status"] == "failed" for ev in replay(data, types="task"))
+
+    class Never(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            raise AssertionError("dispatched twice")
+
+    assert dispatch_all(data, C.Config(), agents={"fake": Never()})["wrote"] == 0
+
+
+def test_restart_before_the_reply_does_not_call_the_adapter(tmp_path):
+    data = tmp_path / "data"
+    append(data, route("route-1", "你好"))
+
+    class Slow(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            emit(task_event(route, status="sent", ref=route["id"], adapter="fake"))
+            emit(task_event(route, status="running", ref="task-route-1-sent", adapter="fake"))
+
+    first = Slow()
+    dispatch_all(data, C.Config(), agents={"fake": first})
+    assert first.calls == ["route-1"]
+    second = Slow()
+    assert dispatch_all(data, C.Config(), agents={"fake": second})["wrote"] == 1
+    assert second.calls == []
+    failed = [ev for ev in replay(data, types="task") if ev["data"]["status"] == "failed"]
+    assert len(failed) == 1 and failed[0]["data"]["error"]
+    assert list(replay(data, types="reply")) == []
+    assert dispatch_all(data, C.Config(), agents={"fake": second})["wrote"] == 0
+
+
+def test_serve_restart_closes_an_interrupted_route_without_calling_again(tmp_path):
+    data = tmp_path / "data"
+    append(data, route("route-1", "你好"))
+    _rewind_dispatch(data)
+    calls = []
+
+    class Once(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            calls.append("handle")
+            emit(task_event(route, status="sent", ref=route["id"], adapter="fake"))
+            emit(task_event(route, status="running", ref="task-route-1-sent", adapter="fake"))
+
+    cfg = C.Config()
+    ready, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=serve, args=(data, cfg),
+        kwargs={"poll_s": 0.05, "stop": stop, "ready": ready, "agents": {"fake": Once()}},
+        daemon=True)
+    thread.start()
+    assert ready.wait(2)
+    deadline = time.time() + 3
+    while time.time() < deadline and "handle" not in calls:
+        time.sleep(0.05)
+    stop.set()
+    thread.join(2)
+    assert calls == ["handle"]
+    assert not thread.is_alive()
+
+    class Never(_Counting):
+        def handle(self, route, emit):
+            super().handle(route, emit)
+            calls.append("again")
+
+    ready, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=serve, args=(data, cfg),
+        kwargs={"poll_s": 0.05, "stop": stop, "ready": ready, "agents": {"fake": Never()}},
+        daemon=True)
+    thread.start()
+    assert ready.wait(2)
+    deadline = time.time() + 3
+    while time.time() < deadline and not any(
+            ev["data"]["status"] == "failed" for ev in replay(data, types="task")):
+        time.sleep(0.05)
+    stop.set()
+    thread.join(2)
+    assert calls == ["handle"]
+    assert any(ev["data"]["status"] == "failed" for ev in replay(data, types="task"))
+    assert list(replay(data, types="reply")) == []
 
 
 def test_unknown_adapter_fails_the_task_instead_of_raising(tmp_path):

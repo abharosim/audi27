@@ -86,24 +86,34 @@ def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep,
             return {"text": text, "completed": True, "interrupted": False, "backend": "log"}
         if not text.strip():
             return {"text": text, "completed": True, "interrupted": False, "backend": "log"}
-        proc = popen(["say", "-v", voice, "--", text])
-        while True:
-            try:
-                talking = bool(stop_check())
-            except Exception:
-                log.exception("could not read whether the user is speaking")
-                talking = False
-            if talking:
-                _stop_proc(proc)
+        try:
+            if stop_check():
                 return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
-            if proc.poll() is not None:
-                break
-            sleep(0.1)
-        if proc.returncode not in (0, None):
-            log.warning("say exited %s; logging the line instead", proc.returncode)
-            log.info("speak: %s", text)
-            return {"text": text, "completed": True, "interrupted": False, "backend": "log"}
-        return {"text": text, "completed": True, "interrupted": False, "backend": "say"}
+        except Exception:
+            log.exception("could not read whether the user is speaking")
+        proc = popen(["say", "-v", voice, "--", text])
+        try:
+            while True:
+                try:
+                    talking = bool(stop_check())
+                except Exception:
+                    log.exception("could not read whether the user is speaking")
+                    talking = False
+                if talking:
+                    _stop_proc(proc)
+                    return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
+                if proc.poll() is not None:
+                    break
+                sleep(0.1)
+            if proc.returncode not in (0, None):
+                log.warning("say exited %s; logging the line instead", proc.returncode)
+                log.info("speak: %s", text)
+                return {"text": text, "completed": True, "interrupted": False, "backend": "log"}
+            return {"text": text, "completed": True, "interrupted": False, "backend": "say"}
+        finally:
+            # A signal, a timeout, or the caller giving up must not leave `say` running.
+            if proc.poll() is None:
+                _stop_proc(proc)
 
     return backend
 
@@ -175,8 +185,18 @@ def speak_pending(data_dir, cfg, *, backend=None, speaking=None, stop: threading
     for brief in unspoken(data_dir):
         if not _wait_quiet(speaking, stop, poll_s):
             break
-        result = _speak_one(brief, cfg, backend, speaking)
-        append(data_dir, spoken_event(brief, result))
+
+        def stop_check():
+            if stop is not None and stop.is_set():
+                return True
+            try:
+                return bool(speaking())
+            except Exception:
+                log.exception("could not read whether the user is speaking")
+                return False
+
+        result = _speak_one(brief, cfg, backend, stop_check)
+        append(data_dir, spoken_event(brief, result), if_absent=True)
         n += 1
     return n
 
@@ -264,27 +284,44 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
     if ready is not None:
         ready.set()
 
-    def speak_new(found, cursor) -> None:
+    def speak_new(found) -> bool:
+        """Speak `found`. False when a brief was not recorded, so the cursor must stay."""
         for brief in found:
             if stop.is_set():
-                return
+                return False
             if _already_spoken(data_dir, brief["id"]):
                 continue
             if not _wait_quiet(speaking, stop, poll_s):
-                return
-            result = _speak_one(brief, cfg, backend, speaking)
+                return False
+
+            def stop_check():
+                if stop.is_set():
+                    return True
+                try:
+                    return bool(speaking())
+                except Exception:
+                    log.exception("could not read whether the user is speaking")
+                    return False
+
+            result = _speak_one(brief, cfg, backend, stop_check)
             try:
-                append(data_dir, spoken_event(brief, result))
+                append(data_dir, spoken_event(brief, result), if_absent=True)
             except OSError:
                 log.exception("spoken event was not written for %s", brief.get("id"))
-                return
-        save(cursor)
+                return False
+        return True
 
     try:
         while not stop.is_set():
+            pending = offsets
             found, offsets = read_new(data_dir, offsets, types="brief")
             if found:
-                speak_new(found, offsets)
+                if speak_new(found):
+                    save(offsets)
+                else:
+                    # Do not keep a cursor that already stepped past a brief we
+                    # did not record. The next poll reads the batch again.
+                    offsets = pending
             elif offsets != durable:
                 save(offsets)
             if stop.wait(poll_s):
@@ -295,7 +332,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
     finally:
         try:
             found, offsets = read_new(data_dir, offsets, types="brief")
-            if found and not stop.is_set():
-                speak_new(found, offsets)
+            if found and not stop.is_set() and speak_new(found):
+                save(offsets)
         except Exception:
             log.exception("speaker did not flush on the way out")

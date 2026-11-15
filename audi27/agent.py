@@ -31,6 +31,11 @@ class Agent:
         whose `ref` is the done task. On failure the last task is `failed` and
         there is no reply. `awaiting_confirmation` is emitted by the dispatcher,
         not by an adapter: a route that needs confirmation is never handed here.
+
+        The dispatcher calls this at most once per route. Emit `sent` before
+        any side effect. A slow agent may call `emit` again after this method
+        returns (the reply can arrive minutes later). On timeout, emit `failed`
+        or raise; a raise is recorded as `failed` and is not retried.
         """
         raise NotImplementedError
 
