@@ -134,6 +134,59 @@ def cmd_web(args, cfg) -> int:
     return 0
 
 
+def _print_event(ev: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(ev, ensure_ascii=False), flush=True)
+        return
+    try:
+        stamp = datetime.fromisoformat(ev["ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        stamp = str(ev.get("ts", ""))
+    data = ev.get("data") or {}
+    if ev.get("type") == "utterance":
+        summary = " ".join(str(data.get("text", "")).split())
+    else:
+        summary = json.dumps(data, ensure_ascii=False)
+        if len(summary) > 160:
+            summary = summary[:157] + "..."
+    ref = ev.get("ref") or "-"
+    print(f"{stamp}  {ev.get('type', ''):<10} {ev.get('source', ''):<12} {ev.get('id', '')}  ref={ref}  {summary}",
+          flush=True)
+
+
+def cmd_events(args, cfg) -> int:
+    from .events import EventError, backfill_utterances, follow, ref_chain, replay
+
+    data_dir = args.data_dir or cfg.store.data_dir
+    try:
+        since = parse_when(args.since) if getattr(args, "since", None) else None
+        until = parse_when(args.until, end_of_day=True) if getattr(args, "until", None) else None
+    except ValueError as e:
+        print(f"bad time: {e}", file=sys.stderr)
+        return 2
+    types = getattr(args, "type", None) or None
+    sources = getattr(args, "source", None) or None
+    try:
+        if args.events_cmd == "backfill":
+            stats = backfill_utterances(data_dir, since=since, until=until)
+            print(f"backfill: wrote {stats['wrote']}, already present {stats['skipped']}")
+            return 0
+        if args.events_cmd == "chain":
+            rows = ref_chain(data_dir, args.id)
+        elif args.events_cmd == "tail":
+            rows = follow(data_dir, since=since, until=until, types=types, sources=sources, poll=args.poll)
+        else:
+            rows = replay(data_dir, since=since, until=until, types=types, sources=sources)
+        for ev in rows:
+            _print_event(ev, getattr(args, "json", False))
+    except EventError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_search(args, cfg) -> int:
     data_dir = args.data_dir or cfg.store.data_dir
     try:
@@ -175,6 +228,30 @@ def main(argv=None) -> int:
     s.add_argument("--ok-only", action="store_true", help="exclude suspect segments")
     s.add_argument("--data-dir")
     s.set_defaults(fn=cmd_search)
+    evp = sub.add_parser("events", help="append-only event stream shared by modules")
+    evsub = evp.add_subparsers(dest="events_cmd", required=True)
+
+    def _window(p, *, kinds=False):
+        p.add_argument("--data-dir")
+        p.add_argument("--since", help="YYYY-MM-DD | ISO datetime | today | yesterday | 30m | 2h | 3d")
+        p.add_argument("--until", help="same formats; a bare date includes that whole day")
+        if kinds:
+            p.add_argument("--type", action="append", help="event type (repeatable; unknown types are allowed)")
+            p.add_argument("--source", action="append", help="writing module (repeatable)")
+            p.add_argument("--json", action="store_true", help="one JSON event per line")
+
+    et = evsub.add_parser("tail", help="print events as they are appended")
+    _window(et, kinds=True)
+    et.add_argument("--poll", type=float, default=0.1, help="seconds between polls")
+    er = evsub.add_parser("replay", help="print events in a time range")
+    _window(er, kinds=True)
+    eb = evsub.add_parser("backfill", help="copy existing transcripts into utterance events")
+    _window(eb)
+    ec = evsub.add_parser("chain", help="follow ref from an event back to its origin")
+    ec.add_argument("id")
+    ec.add_argument("--data-dir")
+    ec.add_argument("--json", action="store_true")
+    evp.set_defaults(fn=cmd_events)
     e = sub.add_parser("eval", help="replay stored audio through other backends and compare")
     e.add_argument("--data-dir")
     esub = e.add_subparsers(dest="eval_cmd", required=True)

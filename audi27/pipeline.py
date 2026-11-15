@@ -146,12 +146,21 @@ class Pipeline:
             record["raw_text"] = t.text
         self.store.append(record)       # record first, then move audio: a crash in between is
         self.store.finish_audio(wav, dest)  # resolved by has_id() on the next start
+        self._emit_utterance(record)    # after the transcript is durable; backfill repairs a miss
         self.counts[v.status] += 1
         if v.status == V.OK:
             self.prev_text = v.text
             self.recent.append(v.text)
         log.info("[%s] %s %s", v.status, v.text[:100] or "-", ",".join(v.reasons))
         return record
+
+    def _emit_utterance(self, record: dict) -> None:
+        """Copy the stored transcript into the event stream. Failure must not drop the transcript or the audio."""
+        try:
+            from .events import emit_utterance
+            emit_utterance(self.store.root, record)
+        except Exception:
+            log.exception("utterance event was not written for %s", record.get("id"))
 
     # --- worker ----------------------------------------------------------
     def _worker(self) -> None:
