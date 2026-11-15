@@ -86,6 +86,24 @@ class Store:
         with open(path, encoding="utf-8") as f:
             return any(needle in line for line in f)
 
+    def get_record(self, rec_id: str, start_ts: float) -> dict | None:
+        """The transcript line with this id, or None when that line is missing or still torn."""
+        path = self.transcripts / f"{_dt(start_ts):%Y-%m-%d}.jsonl"
+        if not path.exists():
+            return None
+        needle = f'"id": "{rec_id}"'
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if needle not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(rec.get("id")) == str(rec_id):
+                    return rec
+        return None
+
     def append(self, record: dict) -> None:
         start = datetime.fromisoformat(record["start"])
         day = start.strftime("%Y-%m-%d")

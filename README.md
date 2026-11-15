@@ -6,6 +6,8 @@ Mac 常驻录音 → 分段 → 转写（本地 Whisper 或云端）→ 校验 �
 麦克风 → Segmenter(能量 VAD) → data/spool/*.wav → Transcriber(可换/可回退) → validate → transcripts/*.jsonl + *.md
 ```
 
+转写文件仍是“说了什么”的依据。每条转写同时写成一条 `utterance` 事件到 `data/events/`；以后的模块只通过这条事件流通信。
+
 ## 运行
 
 ```bash
@@ -15,7 +17,7 @@ cp config.example.toml config.toml   # 可选，不建也能跑默认值
 uv run audi27 devices                # 确认输入设备
 uv run audi27 run                    # 开始常驻录音，Ctrl-C 停止
 uv run audi27 web                    # 另开一个终端：仪表盘 http://127.0.0.1:8727
-uv run pytest                        # 25 个测试，不需要麦克风和模型
+uv run pytest                        # 不需要麦克风和模型
 ```
 
 默认后端是 `mlx_whisper`，直接用本机已缓存的 `mlx-community/whisper-turbo`（`~/.cache/huggingface/hub`），不需要再下载。
@@ -30,9 +32,26 @@ uv run pytest                        # 25 个测试，不需要麦克风和模�
 | `audi27 file a.wav` | 把现成的 16 kHz 单声道 WAV 走一遍完整管线，用来测后端和校验 |
 | `audi27 retry` | 重试 `data/failed/` 和 `data/spool/` 里的片段 |
 | `audi27 search 关键词 ...` | 搜索转写，见 AGENTS.md |
+| `audi27 events replay` | 按时间、类型、来源回放 `data/events/` |
+| `audi27 events tail` | 轮询并打印新事件 |
+| `audi27 events backfill` | 把已有转写补成 `utterance` 事件 |
+| `audi27 events chain <id>` | 顺着 `ref` 追到起因事件 |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
 | `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
+
+## 事件流
+
+模块之间只追加写入 `data/events/YYYY-MM-DD.jsonl`（本地日期，一行一个 JSON）。固定字段：`id`、`ts`（带时区）、`type`、`source`、`ref`（引起它的事件，没有则为 null）、`data`。已知类型：`utterance`、`screen`、`presence`、`turn`、`route`、`task`、`reply`、`brief`、`spoken`。不认识的类型也会原样保存，读的时候不要拒绝。
+
+```bash
+uv run audi27 events replay --since 2h --type utterance
+uv run audi27 events tail
+uv run audi27 events backfill          # 给事件流出现之前的转写补 utterance
+uv run audi27 events chain <id>
+```
+
+`--since` / `--until` 的写法和 `search` 相同。多个进程可以同时追加。最后一行如果只写了一半，读者会跳过它，等它写完。
 
 ## 换转写后端
 

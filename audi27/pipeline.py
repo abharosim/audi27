@@ -106,7 +106,12 @@ class Pipeline:
             self.store.mark_failed(wav, f"unreadable audio: {e}")
             self.counts["failed"] += 1
             return None
-        if self.store.has_id(wav.stem, start_ts):  # recorded before a crash; only cleanup is left
+        if self.store.has_id(wav.stem, start_ts):
+            # Transcript survived a crash and the spool file is the only thing left. The utterance
+            # may not have been written yet; if_absent makes a repeat a no-op.
+            existing = self.store.get_record(wav.stem, start_ts)
+            if existing is not None:
+                self._emit_utterance(existing)
             wav.unlink(missing_ok=True)
             return None
         t = self._transcribe(wav)
@@ -144,14 +149,23 @@ class Pipeline:
             record["corrections"] = corrections
         if t.text != asr_text:
             record["raw_text"] = t.text
-        self.store.append(record)       # record first, then move audio: a crash in between is
-        self.store.finish_audio(wav, dest)  # resolved by has_id() on the next start
+        self.store.append(record)       # transcript first, then the utterance, then move audio.
+        self._emit_utterance(record)    # a crash before this returns leaves the spool file, and
+        self.store.finish_audio(wav, dest)  # the next start emits the utterance via has_id()
         self.counts[v.status] += 1
         if v.status == V.OK:
             self.prev_text = v.text
             self.recent.append(v.text)
         log.info("[%s] %s %s", v.status, v.text[:100] or "-", ",".join(v.reasons))
         return record
+
+    def _emit_utterance(self, record: dict) -> None:
+        """Copy the stored transcript into the event stream. Failure must not drop the transcript or the audio."""
+        try:
+            from .events import emit_utterance
+            emit_utterance(self.store.root, record)
+        except Exception:
+            log.exception("utterance event was not written for %s", record.get("id"))
 
     # --- worker ----------------------------------------------------------
     def _worker(self) -> None:
