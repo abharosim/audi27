@@ -36,6 +36,8 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 events tail` | 轮询并打印新事件 |
 | `audi27 events backfill` | 把已有转写补成 `utterance` 事件 |
 | `audi27 events chain <id>` | 顺着 `ref` 追到起因事件 |
+| `audi27 turns run` | 跟着事件流，把以触发词开头的一轮话写成 `turn` |
+| `audi27 turns replay --since today` | 用历史 utterance 重算 turn，默认只打印 |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
 | `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
@@ -52,6 +54,26 @@ uv run audi27 events chain <id>
 ```
 
 `--since` / `--until` 的写法和 `search` 相同。多个进程可以同时追加。最后一行如果只写了一半，读者会跳过它，等它写完。
+
+## 对话轮次
+
+分段器在 0.8 秒静音处切开，一句「达达，……（停一下）……」会落成好几条 utterance。`turns` 把它们收成一条 `turn`，以后的路由只消费 turn。没以触发词开头的话不产生事件，仍只是环境录音。
+
+- **句首触发**。默认认 `达达`、`哒哒`、`大大`、`DaDa`、`dada`、`Dada`（拉丁字母不区分大小写）。触发词后面可以跟空格或标点。只看去掉开头空白后的开头：句中的「大大」不算，「dadapple」也不算。
+- **`suspect` 算进去，`rejected` 丢掉**。存疑多半是真说过、只是置信度低，漏掉一句命令比多收一句更糟，所以照常并入，并在 turn 上记 `has_suspect`。`rejected` 是幻觉或噪声，整条忽略，也不拿它来延长间隔。其它不认识的 status 同样忽略。
+- **收口**。下一条的开始比上一条的结束晚超过 `gap_s`（默认 2 秒，刚好等于仍合并）就以 `gap` 结束；这一轮的音频时长到了 `max_duration_s`（默认 120 秒，要长过一段的 30 秒硬切）就以 `max` 结束，跨过上限的那一条仍算在里面。间隔还没到又听到触发词，上一轮以 `new_trigger` 结束。间隔已经超过才听到触发词，上一轮记 `gap`。
+- **实时**。`audi27 turns run` 跟着事件流写 `turn`，从启动时的末尾开始看，不补历史。一条话说完如果没有下一条，不能干等，所以看到 utterance 之后再等 `wall_close_s`（默认 8 秒）就以 `timeout` 结束。这 8 秒是在等转写落盘，合并不合并仍看音频上的 `gap_s`。进程退出时还开着的一轮记 `eof`。
+- **回放**。`audi27 turns replay` 只用 utterance 的时间戳，同一份输入结果相同，默认只打印。`--output` 写到另一个 JSONL，`--write` 才追加进事件流；turn 的 id 由第一条 utterance 决定（`ref` 也指向它），重复跑不会写重。回放结束时还开着的一轮记 `eof`。
+
+不要把「大大」加进 `context.md` 的术语替换：那里是整句替换，句中的「大大」也会被改掉。
+
+```bash
+uv run audi27 turns replay --since today          # 先拿真实转写看误触发和漏触发
+uv run audi27 turns replay --since today --json
+uv run audi27 turns run                           # 常驻写 turn
+```
+
+`config.toml` 里 `[turns] enabled = true` 时，`./start.sh`（`audi27 supervise`）会把 `turns run` 和录音、仪表盘一起拉起来。默认关着。
 
 ## 换转写后端
 

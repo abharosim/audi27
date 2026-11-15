@@ -72,6 +72,17 @@ class StoreCfg:
 
 
 @dataclass
+class TurnsCfg:
+    # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
+    enabled: bool = False
+    # Keep this list in sync with audi27.turns.DEFAULT_TRIGGERS.
+    triggers: list = field(default_factory=lambda: ["达达", "哒哒", "大大", "DaDa", "dada", "Dada"])
+    gap_s: float = 2.0
+    max_duration_s: float = 120.0
+    wall_close_s: float = 8.0
+
+
+@dataclass
 class Config:
     audio: AudioCfg = field(default_factory=AudioCfg)
     segment: SegmentCfg = field(default_factory=SegmentCfg)
@@ -79,6 +90,7 @@ class Config:
     validate: ValidateCfg = field(default_factory=ValidateCfg)
     store: StoreCfg = field(default_factory=StoreCfg)
     correct: CorrectCfg = field(default_factory=CorrectCfg)
+    turns: TurnsCfg = field(default_factory=TurnsCfg)
     backend: dict = field(default_factory=dict)  # name -> constructor kwargs
     corrector: dict = field(default_factory=dict)  # name -> constructor kwargs
 
@@ -96,6 +108,7 @@ def load(path: str | Path | None = None) -> Config:
     if path is None:
         path = Path("config.toml")
         if not path.exists():
+            _check_turns(cfg)
             return cfg
     path = Path(path)
     try:
@@ -119,7 +132,27 @@ def load(path: str | Path | None = None) -> Config:
     cfg.transcribe.languages = [x.lower() for x in langs]
     if not cfg.transcribe.backends:
         raise ConfigError("transcribe.backends is empty")
+    _check_turns(cfg)
     return cfg
+
+
+def _check_turns(cfg: Config) -> None:
+    t = cfg.turns
+    if not isinstance(t.enabled, bool):
+        raise ConfigError("turns.enabled must be true or false")
+    if (not isinstance(t.triggers, list) or not t.triggers
+            or not all(isinstance(x, str) and x.strip() for x in t.triggers)):
+        raise ConfigError('turns.triggers must be a non-empty list of strings, e.g. ["达达", "dada"]')
+    t.triggers = [x.strip() for x in t.triggers]
+    for name in ("gap_s", "max_duration_s", "wall_close_s"):
+        value = getattr(t, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"turns.{name} must be a number")
+        setattr(t, name, float(value))
+    if t.gap_s < 0 or t.wall_close_s < 0:
+        raise ConfigError("turns.gap_s and turns.wall_close_s must be >= 0")
+    if t.max_duration_s <= 0:
+        raise ConfigError("turns.max_duration_s must be > 0")
 
 
 _FROM_DOTENV: set = set()

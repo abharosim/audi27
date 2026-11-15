@@ -104,8 +104,17 @@ def supervise(data_dir: str | Path, specs: dict[str, list[str]], reexec, poll_s:
         _stop(procs, grace_s)
 
 
-def main(config_path: str | None, data_dir: str, host: str, port: int) -> None:
+def child_specs(config_path: str | None, host: str, port: int, *, turns: bool = False) -> dict[str, list[str]]:
+    """Recorder and dashboard, plus the live turn assembler when `[turns] enabled` is set."""
     base = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     specs = {"run": base + ["run"], "web": base + ["web", "--host", host, "--port", str(port)]}
-    argv = base + ["supervise", "--host", host, "--port", str(port)]
+    if turns:
+        specs["turns"] = base + ["turns", "run"]
+    return specs
+
+
+def main(config_path: str | None, data_dir: str, host: str, port: int, *, turns: bool = False) -> None:
+    specs = child_specs(config_path, host, port, turns=turns)
+    argv = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
+    argv += ["supervise", "--host", host, "--port", str(port)]
     supervise(data_dir, specs, lambda: os.execv(sys.executable, argv))
