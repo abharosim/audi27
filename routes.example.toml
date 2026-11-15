@@ -41,12 +41,15 @@ address = [
 
 # Side-effecting actions. A hit sets needs_confirmation and does not change
 # the target. Latin words use a word boundary, so "poster" is not "post".
-# Bare 推送 is intentionally absent: it is also how notification 推送 is said.
+# A Chinese phrase still matches when 一下 / 个 / 一封 sits inside it, so
+# "推一下代码" and "发封邮件" count. "推一下" covers "把代码推一下"
+# (the object comes first). Bare 推送 is absent: that is also notification 推送.
 confirm = [
   "发邮件", "发送邮件", "发一封邮件", "发个邮件", "send email", "send an email",
-  "付款", "支付", "付钱", "转账", "下单", "购买", "买单", "买",
-  "删除", "删掉", "删了", "delete",
-  "git push", "推代码", "推上去", "推送代码", "push",
+  "send the email", "send emails",
+  "付款", "支付", "付钱", "付一下", "转账", "下单", "购买", "买单", "买",
+  "删除", "删掉", "删了", "删一下", "删个", "delete",
+  "git push", "推代码", "推上去", "推送代码", "推一下", "push",
   "发帖", "发推", "发微博", "tweet", "post",
 ]
 
@@ -66,14 +69,17 @@ words = [
 ]
 
 # The whole turn, not a substring. "算了下个月的账" is still a normal request.
+# Repeating one ("算了算了") or stacking two of these ("算了，不用了") still counts.
+# A trailing 谢谢 / please does too.
 [[whole]]
 name = "not_a_command"
 target = "none"
 phrases = ["算了", "不用了", "没事了", "没事", "没什么", "不是对你说", "随便说说"]
 
 # Report-queue controls. The turn must be the phrase plus fillers
-# (这个 / 一下 / 吧 / 的 / 吗 …), so "跳过这个文件" and "详细说说职业规划"
-# stay ordinary requests. `command` is the normalized value written on the event.
+# (这个 / 一下 / 吧 / 的 / 吗 / 谢谢 …), so "跳过这个文件" and "详细说说职业规划"
+# stay ordinary requests. Repeating the same command ("跳过跳过") still counts;
+# two different commands ("跳过稍后") do not. `command` is what the event stores.
 [[queue]]
 command = "details"
 phrases = ["详细说说", "详细说", "说详细点", "展开说说", "展开讲讲", "details"]

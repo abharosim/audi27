@@ -9,8 +9,10 @@ the next turn without a restart.
 Decision order, first match wins:
 
 1. an agent name in the text (发给 Muse / Cloud Code / 本地模型 / …)
-2. a queue-control phrase that is the whole turn (跳过, 详细说说, …)
-3. a whole-turn "not a command" phrase (算了, 不用了, …) -> target `none`
+2. a queue-control phrase that is the whole turn (跳过, 详细说说, …),
+   including a repeat of that same phrase
+3. a whole-turn "not a command" phrase (算了, 不用了, …) -> target `none`,
+   including several of them stacked ("算了算了", "算了，不用了")
 4. keyword rules, in file order
 5. the optional local classifier, only if nothing above matched
 6. the file's default target (grok unless the file says otherwise)
@@ -53,12 +55,21 @@ _ROUTE_ID = re.compile(r"route-[^\s/]{1,240}\Z")
 _NAME_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,40}\Z")
 _TOP_KEYS = {"default", "agents", "address", "keyword", "whole", "queue", "confirm"}
 
-# Fillers that may follow a queue or "not a command" phrase. Anything else
+# May sit around a queue or "not a command" phrase. Anything else
 # ("跳过这个文件", "算了下个月的账") means the turn is a real request.
-_TAIL = re.compile("^(?:这个|这条|一下|当前|汇报|吧|啊|呀|了|的|哦|噢|哈|呢|吗|嘛|哟)*$")
+# Longest match wins, so list order is not the matcher. "谢谢" is the trailing
+# thanks on "不用了谢谢"; "please" is the same after "skip".
+_FILLERS = (
+    "谢谢你", "谢谢了", "谢谢", "please",
+    "这个", "这条", "一下", "当前", "汇报",
+    "吧", "啊", "呀", "了", "的", "哦", "噢", "哈", "呢", "吗", "嘛", "哟",
+)
 _COMPACT_DROP = re.compile(r"[\s\u3000，。！？、,.!?;；:：\"'“”‘’「」『』（）()\[\]【】…·~～]+")
-# Longest first. Peeled only when they sit immediately before an address verb.
+# Longest first. A trailing one counts only as its own word (the 请 in 申请 does not).
 _POLITE = ("请帮我", "帮我", "麻烦你", "麻烦", "请你", "请", "please")
+# Spoken Chinese puts one of these between a verb and its object: 推一下代码, 发封邮件.
+_CONFIRM_GAP = "(?:一下子|一下|一个|一封|个|封)?"
+_LABEL_PUNCT = "。.`\"'“”「」『』,，！!？?；;:：()（）[]【】"
 
 _LABEL = {
     "grok": "Grok",
@@ -82,7 +93,7 @@ CLASSIFY_SYSTEM = (
 _FALLBACK_TOML = """
 default = "grok"
 address = ["send to", "问一下", "发给", "使用", "tell", "ask", "让", "用", "问", "给", "请"]
-confirm = ["发邮件", "发送邮件", "付款", "支付", "买", "删除", "删掉", "删了", "delete", "git push", "推代码", "push", "发帖", "tweet", "post"]
+confirm = ["发邮件", "发送邮件", "付款", "支付", "付钱", "付一下", "转账", "买", "删除", "删掉", "删了", "删一下", "删个", "delete", "git push", "推代码", "推一下", "push", "发帖", "tweet", "post", "send the email", "send email"]
 [agents]
 muse = ["muse", "缪斯"]
 grok = ["grok", "grog", "grokbot", "grok bot"]
@@ -308,9 +319,10 @@ def resolve_rules_path(configured: str = "routes.toml") -> Path | None:
 def get_rules(configured: str = "routes.toml", *, strict: bool = False) -> Rules:
     """Rules from `configured`, re-read when the file's mtime changes.
 
-    A broken save keeps the previous good copy (and is logged). `strict` raises
-    instead, which is what `route test` and `route replay` want so a typo is
-    visible. The live process uses the lenient path and keeps routing.
+    A broken save keeps the previous good copy (and is logged). With no good
+    copy yet, the example file is used so a typo does not drop the confirm
+    list. `strict` raises instead, which is what `route test` and `route replay`
+    want so a typo is visible. The live process uses the lenient path and keeps routing.
     """
     path = resolve_rules_path(configured)
     if path is None:
@@ -320,8 +332,9 @@ def get_rules(configured: str = "routes.toml", *, strict: bool = False) -> Rules
     except OSError as e:
         if strict:
             raise RulesError(f"cannot read {path}: {e}") from e
+        log.warning("routes file %s: %s", path, e)
         hit = _cache.get(str(path.resolve()))
-        return hit[1] if hit else _fallback_rules()
+        return hit[1] if hit else _backup_rules(path)
     key = str(path.resolve())
     hit = _cache.get(key)
     if hit and hit[0] == mtime:
@@ -332,9 +345,34 @@ def get_rules(configured: str = "routes.toml", *, strict: bool = False) -> Rules
         log.warning("routes file %s: %s", path, e)
         if strict:
             raise RulesError(str(e)) from e
-        return hit[1] if hit else _fallback_rules()
+        return hit[1] if hit else _backup_rules(path)
     _cache[key] = (mtime, rules)
     return rules
+
+
+def _backup_rules(failed: Path) -> Rules:
+    """Example file when `failed` will not parse, else the embedded copy.
+
+    A typo in routes.toml must not silently drop to the shorter embedded list
+    while routes.example.toml is sitting next to the package.
+    """
+    example = _example_path()
+    try:
+        same = example.resolve() == Path(failed).resolve()
+    except OSError:
+        same = False
+    if example.is_file() and not same:
+        try:
+            rules = load_rules(example)
+        except (RulesError, OSError, UnicodeError) as e:
+            log.warning("routes example %s: %s", example, e)
+        else:
+            key = f"backup:{failed}"
+            if key not in _warned:
+                log.warning("routes file %s is unusable; using %s", failed, example.name)
+                _warned.add(key)
+            return rules
+    return _fallback_rules()
 
 
 def _compact(text: str) -> str:
@@ -376,9 +414,12 @@ def _cut_suffix(text: str, suffix: str) -> str | None:
 
 
 def _peel_polite(text: str) -> str:
+    """Drop one trailing 帮我/请/please that stands alone, not the 请 inside 申请 or 邀请."""
     for polite in _POLITE:
         cut = _cut_suffix(text, polite)
-        if cut is not None:
+        if cut is None:
+            continue
+        if cut == "" or _rstrip_sep(cut) != cut:
             return cut
     return text
 
@@ -439,37 +480,99 @@ def _find_agent(text: str, rules: Rules) -> _Hit | None:
     return max(hits, key=lambda h: (h.addressed, -h.start, h.end - h.start))
 
 
-def _match_phrase(compact: str, rows) -> str | None:
-    body = compact
+def _starts_with_polite(body: str) -> bool:
     for polite in _POLITE:
         token = _compact(polite)
         if token and body.startswith(token):
-            body = body[len(token):]
+            return True
+    return False
+
+
+def _strip_leading_polite(body: str, rows) -> str:
+    """Drop 请/帮我/please only when what follows is still a command, not the 请 in 请求."""
+    while body:
+        stripped = False
+        for polite in _POLITE:
+            token = _compact(polite)
+            if not token or not body.startswith(token):
+                continue
+            rest = body[len(token):]
+            if any(rest.startswith(phrase) for _, phrase in rows) or _starts_with_polite(rest):
+                body = rest
+                stripped = True
+                break
+        if not stripped:
             break
+    return body
+
+
+def _phrase_cover(body: str, phrases: list[str]) -> bool:
+    """True when `body` is only these phrases and fillers, and at least one phrase."""
+    phrases = sorted(phrases, key=len, reverse=True)
+    saw = False
+    while body:
+        best = 0
+        is_phrase = False
+        for phrase in phrases:
+            if len(phrase) > best and body.startswith(phrase):
+                best = len(phrase)
+                is_phrase = True
+        for filler in _FILLERS:
+            if len(filler) > best and body.startswith(filler):
+                best = len(filler)
+                is_phrase = False
+        if best == 0:
+            return False
+        saw = saw or is_phrase
+        body = body[best:]
+    return saw
+
+
+def _match_phrase(compact: str, rows, *, mix: bool) -> str | None:
+    """Whole-turn match. `mix` allows different phrases from `rows` in one turn.
+
+    Queue commands stay unmixed, so "跳过稍后" is not a command. "算了，不用了"
+    and "跳过跳过" still match. A phrase has to start the turn (after 请/帮我).
+    """
+    body = _strip_leading_polite(compact, rows)
+    grouped: dict[str, list[str]] = {}
     for label, phrase in rows:
-        if body.startswith(phrase) and _TAIL.fullmatch(body[len(phrase):]):
+        grouped.setdefault(label, []).append(phrase)
+    for label, phrase in rows:
+        if not body.startswith(phrase):
+            continue
+        allowed = [item for group in grouped.values() for item in group] if mix else grouped[label]
+        if _phrase_cover(body, allowed):
             return label
     return None
 
 
-def _has(text_folded: str, word: str) -> bool:
+def _has(text_folded: str, word: str, *, gap: bool = False) -> bool:
     word_f = unicodedata.normalize("NFKC", word).casefold().strip()
     if not word_f:
         return False
     if re.search(r"[a-z0-9]", word_f):
-        parts = word_f.split()
+        parts = [p for p in word_f.split() if p]
+        if not parts:
+            return False
         body = r"\s+".join(re.escape(p) for p in parts)
         if re.match(r"[a-z0-9]", parts[0]):
             body = r"(?<![a-z0-9])" + body
         if re.search(r"[a-z0-9]$", parts[-1]):
             body += r"(?![a-z0-9])"
         return re.search(body, text_folded) is not None
+    if gap and len(word_f) > 1:
+        body = _CONFIRM_GAP.join(re.escape(ch) for ch in word_f)
+        # 对付一下 is "deal with it", not a payment. 帮我付一下 is.
+        if word_f.startswith("付"):
+            body = r"(?<!对)" + body
+        return re.search(body, text_folded) is not None
     return word_f in text_folded
 
 
 def needs_confirmation(text: str, rules: Rules) -> bool:
     folded = unicodedata.normalize("NFKC", text).casefold()
-    return any(_has(folded, word) for word in rules.confirm)
+    return any(_has(folded, word, gap=True) for word in rules.confirm)
 
 
 def _reason(rule: str) -> str:
@@ -485,12 +588,13 @@ def _reason(rule: str) -> str:
 
 
 def _parse_label(raw) -> str | None:
+    """muse / grok / none, after fullwidth and surrounding punctuation. Anything else is refused."""
     if not isinstance(raw, str):
         return None
-    token = raw.strip().split()[:1]
+    token = unicodedata.normalize("NFKC", raw).strip().split()[:1]
     if not token:
         return None
-    label = token[0].strip("。.`\"'“”「」,，").casefold()
+    label = token[0].strip(_LABEL_PUNCT).casefold()
     return label if label in LLM_TARGETS else None
 
 
@@ -531,11 +635,11 @@ def decide(text: str, rules: Rules, *, classify=None, timeout_s: float = 8.0) ->
     if hit is not None:
         return done(hit.target, _message(norm, hit.start, hit.end, rules.address), f"explicit:{hit.target}", "rule")
 
-    command = _match_phrase(_compact(norm), rules.queue)
+    command = _match_phrase(_compact(norm), rules.queue, mix=False)
     if command is not None:
         return done("queue", _collapse(norm), f"queue:{command}", "rule", command)
 
-    whole = _match_phrase(_compact(norm), rules.whole)
+    whole = _match_phrase(_compact(norm), rules.whole, mix=True)
     if whole is not None:
         return done("none", _collapse(norm), f"none:{whole}", "rule")
 
@@ -606,12 +710,17 @@ def make_classifier(cfg):
         log.warning("route classifier is off: %s", e)
         return None
 
+    lock = threading.Lock()
+
     def classify(text: str) -> str:
+        # One call at a time. A timed-out call may still be running; the next
+        # turn waits only inside `decide`'s timeout and then uses the default.
         messages = [
             {"role": "system", "content": CLASSIFY_SYSTEM},
             {"role": "user", "content": text},
         ]
-        return corrector.complete(messages, 16)
+        with lock:
+            return corrector.complete(messages, 16)
 
     return classify
 

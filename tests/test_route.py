@@ -67,6 +67,11 @@ CASES = [
     ("请跳过", "queue", "skip", False, "rule"),
     ("请帮我跳过", "queue", "skip", False, "rule"),
     ("skip", "queue", "skip", False, "rule"),
+    ("skip please", "queue", "skip", False, "rule"),
+    ("跳过跳过", "queue", "skip", False, "rule"),
+    ("跳过吧跳过", "queue", "skip", False, "rule"),
+    ("请你帮我跳过", "queue", "skip", False, "rule"),
+    ("跳过稍后", "grok", None, False, "default"),
     ("帮我跳过这个文件", "grok", None, False, "default"),
     ("稍后", "queue", "later", False, "rule"),
     ("等一下", "queue", "later", False, "rule"),
@@ -84,6 +89,11 @@ CASES = [
     ("算了", "none", None, False, "rule"),
     ("算了吧", "none", None, False, "rule"),
     ("不用了", "none", None, False, "rule"),
+    ("算了算了", "none", None, False, "rule"),
+    ("不用了不用了", "none", None, False, "rule"),
+    ("算了，不用了", "none", None, False, "rule"),
+    ("不用了谢谢", "none", None, False, "rule"),
+    ("没事了谢谢你", "none", None, False, "rule"),
     ("算了下个月的账", "grok", None, False, "default"),
     ("没事找事", "grok", None, False, "default"),
     ("", "none", None, False, "rule"),
@@ -91,15 +101,40 @@ CASES = [
     ("？？", "none", None, False, "rule"),
     ("帮我发邮件给张三", "grok", None, True, "default"),
     ("让 Muse 发一封邮件给 hr", "muse", None, True, "rule"),
+    ("发封邮件给张三", "grok", None, True, "default"),
+    ("帮我发一下邮件", "grok", None, True, "default"),
+    ("send the email to hr", "grok", None, True, "default"),
+    ("send emails to the team", "grok", None, True, "default"),
     ("帮我买杯咖啡", "grok", None, True, "default"),
+    ("帮我付一下钱", "grok", None, True, "default"),
+    ("帮我付一下", "grok", None, True, "default"),
+    ("转一下账", "grok", None, True, "default"),
+    ("对付一下这个 bug", "grok", None, False, "default"),
     ("把那个文件删了", "grok", None, True, "default"),
+    ("帮我删一下那个文件", "grok", None, True, "default"),
+    ("删个文件", "grok", None, True, "default"),
     ("git push 一下", "grok", None, True, "default"),
+    ("帮我推一下代码", "grok", None, True, "default"),
+    ("把代码推一下", "grok", None, True, "default"),
+    ("让 Cloud Code 把代码推一下", "claude_code", None, True, "rule"),
+    ("让cloud code推一下代码", "claude_code", None, True, "rule"),
     ("帮我 post 到论坛", "grok", None, True, "default"),
+    ("发个帖", "grok", None, True, "default"),
     ("poster design", "grok", None, False, "default"),
     ("notification 推送", "grok", None, False, "default"),
+    ("推送一下", "grok", None, False, "default"),
+    ("推荐一下这篇", "grok", None, False, "default"),
+    ("删减这段", "grok", None, False, "default"),
+    ("发一下言", "grok", None, False, "default"),
     ("问一下 Cloud Code，push 一下代码", "claude_code", None, True, "rule"),
     ("帮我把代码 push 上去", "grok", None, True, "default"),
     ("Muse 帮我看看 offer", "muse", None, False, "rule"),
+    ("music", "grok", None, False, "default"),
+    ("the cloud is nice", "grok", None, False, "default"),
+    ("cloudflare status", "grok", None, False, "default"),
+    ("grokking algorithms", "grok", None, False, "default"),
+    ("iCloud code", "grok", None, False, "default"),
+    ("in the cloud, code review", "grok", None, False, "default"),
 ]
 
 
@@ -138,9 +173,25 @@ def test_sentence_routes(text, target, command, confirm, method):
     ("下个月面试怎么准备", "下个月面试怎么准备"),
     ("Muse 帮我看看 offer", "Muse 帮我看看 offer"),
     ("问一下Ｍｕｓｅ明天的会", "明天的会"),
+    ("请用本地模型总结一下", "总结一下"),
+    ("申请问一下 Muse 这件事", "申请问一下 Muse 这件事"),
+    ("帮我申请发给 Muse 看看进度", "帮我申请发给 Muse 看看进度"),
+    ("邀请发给 Muse 看看", "邀请发给 Muse 看看"),
+    ("请求发给 Claude Code 修一下", "请求发给 Claude Code 修一下"),
 ])
 def test_addressing_is_removed_from_the_message(text, message):
     assert decide(text, RULES).text == message
+
+
+def test_address_strip_keeps_words_that_only_end_in_qing():
+    for text in ("申请问一下 Muse 这件事", "帮我申请发给 Muse 看看进度", "邀请发给 Muse 看看"):
+        decision = decide(text, RULES)
+        assert decision.target == "muse"
+        assert decision.text == text
+    kept = decide("请求发给 Claude Code 修一下", RULES)
+    assert kept.target == "claude_code"
+    assert kept.text == "请求发给 Claude Code 修一下"
+    assert decide("请用本地模型总结一下", RULES).text == "总结一下"
 
 
 def test_explicit_name_is_the_rule_even_when_a_keyword_also_matches():
@@ -167,7 +218,14 @@ def test_classifier_only_sees_leftovers_and_cannot_name_claude():
     assert (decision.target, decision.method, decision.rule) == ("none", "llm", "llm")
     assert seen == ["今天天气怎么样"]
     assert decide("今天天气怎么样", RULES, classify=lambda _t: "claude_code").method == "default"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "local").method == "default"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "queue").method == "default"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "claude code").method == "default"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "Claude_Code").method == "default"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: {"target": "claude_code"}).method == "default"
     assert decide("今天天气怎么样", RULES, classify=lambda _t: "  Muse\n").target == "muse"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "ｍｕｓｅ").target == "muse"
+    assert decide("今天天气怎么样", RULES, classify=lambda _t: "none!").target == "none"
 
     def boom(_text):
         raise RuntimeError("down")
@@ -219,6 +277,22 @@ def test_rules_are_reread_when_the_file_changes(tmp_path):
     assert decide("吃个苹果", get_rules(str(path))).target == "muse"  # last good copy
     with pytest.raises(RulesError):
         get_rules(str(path), strict=True)
+
+
+def test_broken_rules_file_keeps_routing_from_the_example(tmp_path):
+    path = tmp_path / "routes.toml"
+    path.write_text("this is not [[ toml\n", encoding="utf-8")
+    rules = get_rules(str(path))
+    assert rules.path.endswith("routes.example.toml")
+    assert decide("展开说说", rules).command == "details"
+    assert decide("下个月面试怎么准备", rules).target == "muse"
+    with pytest.raises(RulesError):
+        get_rules(str(path), strict=True)
+    path.write_text('default = "none"\n', encoding="utf-8")
+    os.utime(path, (time.time() + 10, time.time() + 10))
+    fixed = get_rules(str(path))
+    assert fixed.path == str(path.resolve())
+    assert decide("今天天气怎么样", fixed).target == "none"
 
 
 def test_missing_routes_toml_uses_the_example():
