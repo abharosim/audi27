@@ -338,7 +338,9 @@ def test_say_is_killed_within_a_third_of_a_second_and_not_left_running(tmp_path)
 
     def run():
         holder["result"] = say_backend(
-            popen=popen, which=lambda _name: "/usr/bin/say", sleep=time.sleep, platform="darwin",
+            popen=popen, which=lambda _name: "/usr/bin/say",
+            sleep=lambda seconds: time.sleep(0.05 if seconds > 0.05 else seconds),
+            platform="darwin", group=True, term_timeout=0.2,
         )("你好", "Tingting", lambda: busy(tmp_path, cfg.presence))
 
     thread = threading.Thread(target=run, daemon=True)
@@ -357,10 +359,15 @@ def test_say_is_killed_within_a_third_of_a_second_and_not_left_running(tmp_path)
     # `say` that ignores SIGTERM is killed, not left running. The first check is
     # quiet so the process actually starts; the next one is the barge-in.
     class IgnoresTerm(FakeProc):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
         def terminate(self):
             self.terminated = True
 
         def wait(self, timeout=None):
+            self.timeouts.append(timeout)
             if self.returncode is None:
                 raise subprocess.TimeoutExpired("say", timeout or 1)
             return self.returncode
@@ -374,10 +381,11 @@ def test_say_is_killed_within_a_third_of_a_second_and_not_left_running(tmp_path)
 
     result = say_backend(
         popen=lambda _cmd: stubborn, which=lambda _name: "/usr/bin/say",
-        sleep=lambda _s: None, platform="darwin",
+        sleep=lambda _s: None, platform="darwin", group=True, term_timeout=0.2,
     )("你好", "Tingting", later)
     assert result["interrupted"] is True
     assert stubborn.terminated and stubborn.killed and stubborn.poll() is not None
+    assert stubborn.timeouts == [0.2, 0.2]
 
 
 def test_say_does_not_start_while_the_presence_file_says_speaking(tmp_path):
@@ -468,6 +476,221 @@ def test_presence_config_defaults_off_and_supervisor_does_not_spawn_it(tmp_path)
                         dispatch=True, queue=True, speak=True)
     assert "presence" not in specs
     assert set(specs) == {"run", "web", "turns", "route", "dispatch", "queue", "speak"}
+
+
+def test_the_file_is_published_before_the_event_and_errors_stay_inside(tmp_path):
+    """Barge-in reads the file. It must not wait on the event log, and a bad
+    append or a bad replace must not escape into the recorder."""
+    from audi27.events import EventError
+
+    cfg = cfg_on(onset_ms=0)
+    seen = {}
+
+    def boom(root, event):
+        seen["during_append"] = load_presence(root)["state"]
+        raise EventError("not json")
+
+    pub = PresencePublisher(tmp_path, cfg.presence, append_fn=boom)
+    assert pub.tick(True, 1.0) is None
+    assert seen["during_append"] == "speaking"
+    assert load_presence(tmp_path)["state"] == "speaking"
+
+    blocked = threading.Event()
+    release = threading.Event()
+
+    def slow(root, event):
+        blocked.set()
+        assert release.wait(2)
+        append(root, event)
+
+    deferred = tmp_path / "deferred"
+    pub = PresencePublisher(deferred, cfg.presence, append_fn=slow, defer_log=True)
+    started = time.monotonic()
+    ev = pub.tick(True, 2.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.25
+    assert ev["data"]["state"] == "speaking"
+    assert load_presence(deferred)["state"] == "speaking"
+    assert list(replay(deferred, types="presence")) == []
+    assert blocked.wait(1)
+    release.set()
+    closed = pub.close(3.0)
+    assert closed["data"]["state"] == "quiet"
+    assert _states(replay(deferred, types="presence")) == ["speaking", "quiet"]
+
+
+def test_a_failed_replace_removes_the_temp_file_and_keeps_the_old_one(tmp_path, monkeypatch):
+    import audi27.presence as presence_mod
+
+    write_presence(tmp_path, file("quiet", 1.0, 1.0))
+    parents = {}
+
+    def boom(src, dst):
+        parents["src"] = Path(src).parent
+        parents["dst"] = Path(dst).parent
+        raise OSError("cross-device")
+
+    monkeypatch.setattr(presence_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        write_presence(tmp_path, file("speaking", 2.0, 2.0, True))
+    assert parents["src"] == parents["dst"] == tmp_path
+    assert not (tmp_path / "presence.json.tmp").exists()
+    assert load_presence(tmp_path)["state"] == "quiet"
+
+
+def test_flag_off_say_stays_on_the_old_kill_path(monkeypatch):
+    import audi27.speak as speak_mod
+
+    seen = []
+
+    def fake_say_backend(**kwargs):
+        seen.append(kwargs)
+        return lambda *_a, **_k: {"text": "", "completed": True, "interrupted": False, "backend": "log"}
+
+    monkeypatch.setattr(speak_mod, "say_backend", fake_say_backend)
+    speak_mod.build_backend(C.Config())
+    speak_mod.build_backend(cfg_on())
+    assert seen[0].get("group", False) is False
+    assert seen[0].get("term_timeout", 1.0) == 1.0
+    assert seen[1]["group"] is True and seen[1]["term_timeout"] == 0.2
+
+
+def test_a_process_that_ignores_sigterm_is_killed_inside_the_grace():
+    """Presence gives `say` 0.2 s to honor SIGTERM, then SIGKILL. It must not wait the flag-off 1 s."""
+    import os
+    import signal
+    import sys
+
+    from audi27.speak import _stop_proc
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"],
+        start_new_session=True,
+    )
+    proc._audi27_group = True
+    proc._audi27_pgid = proc.pid
+    try:
+        started = time.monotonic()
+        _stop_proc(proc, 0.2)
+        assert time.monotonic() - started < 0.6
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=1)
+
+
+def test_a_child_that_ignores_sigterm_is_reaped_with_the_group(tmp_path):
+    """The leader exits on SIGTERM; a child that ignores it must not be left running."""
+    import os
+    import signal
+    import sys
+
+    from audi27.speak import _stop_proc
+
+    marker = tmp_path / "child-pid"
+    script = (
+        "import os, signal, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+        "    with open(sys.argv[1], 'w') as fh:\n"
+        "        fh.write(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(marker)], start_new_session=True,
+    )
+    proc._audi27_group = True
+    proc._audi27_pgid = proc.pid
+    try:
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child = int(marker.read_text())
+        started = time.monotonic()
+        _stop_proc(proc, 0.2)
+        assert time.monotonic() - started < 0.6
+        assert proc.poll() is not None
+        gone = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.02)
+        assert gone
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=1)
+
+
+def test_continuous_speech_reoffers_a_brief_once_and_replay_matches(tmp_path):
+    from audi27.queue import serve as queue_serve
+    from audi27.queue import ReportQueue
+    from audi27.speak import serve as speak_serve
+
+    data = tmp_path / "data"
+    cfg = cfg_on()
+    calls = []
+    spoke = threading.Event()
+
+    def backend(text, _voice, _stop):
+        calls.append(text)
+        write_presence(data, file("speaking", time.time(), time.time(), True))
+        spoke.set()
+        return {"text": text, "completed": False, "interrupted": True, "backend": "mock"}
+
+    stop = threading.Event()
+    q_ready, s_ready = threading.Event(), threading.Event()
+    qt = threading.Thread(
+        target=queue_serve, args=(data, cfg),
+        kwargs={"poll_s": 0.05, "stop": stop, "ready": q_ready}, daemon=True)
+    st = threading.Thread(
+        target=speak_serve, args=(data, cfg),
+        kwargs={"poll_s": 0.05, "stop": stop, "ready": s_ready, "backend": backend,
+                "speaking": lambda: busy(data, cfg.presence)}, daemon=True)
+    qt.start()
+    st.start()
+    try:
+        assert q_ready.wait(2) and s_ready.wait(2)
+        write_presence(data, file("quiet", time.time(), time.time() - 10))
+        append(data, reply("a", "甲。细节"))
+        assert spoke.wait(3)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if [ev["id"] for ev in replay(data, types="brief")] == ["brief-a", "brief-a-2"]:
+                break
+            time.sleep(0.05)
+        # Keep the file fresh. A stale "speaking" file is unknown and would let
+        # the speaker start the re-offer, which is a different bug.
+        write_presence(data, file("speaking", time.time(), time.time(), True))
+        time.sleep(0.35)
+        briefs = [ev["id"] for ev in replay(data, types="brief")]
+        spoken = list(replay(data, types="spoken"))
+        assert calls == ["甲。"]
+        assert briefs == ["brief-a", "brief-a-2"]
+        assert len(spoken) == 1 and spoken[0]["ref"] == "brief-a"
+        assert spoken[0]["data"]["interrupted"] is True and spoken[0]["data"]["completed"] is False
+        again = ReportQueue().push_all(list(replay(data)))
+        assert [ev["id"] for ev in again] == briefs
+    finally:
+        stop.set()
+        qt.join(2)
+        st.join(2)
 
 
 def test_presence_events_round_trip_through_replay(tmp_path):

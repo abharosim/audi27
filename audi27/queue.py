@@ -65,6 +65,7 @@ class _Followup:
     text: str = ""
     text_ref: str = ""
     item_id: str | None = None
+    attempts: int = 0
 
 
 @dataclass
@@ -75,6 +76,7 @@ class ReportQueue:
     summarize_fn: object | None = None
     items: list[Item] = field(default_factory=list)
     inflight: Item | None = None
+    inflight_follow: _Followup | None = None
     last: Item | None = None
     holding: str | None = None
     disposition: str | None = None  # None, "drop" (skip/close), "back" (later)
@@ -205,7 +207,7 @@ class ReportQueue:
     def _close(self) -> list[dict]:
         self.items.clear()
         self.followups.clear()
-        if self.inflight is not None:
+        if self.inflight is not None or self.inflight_follow is not None:
             self.disposition = "drop"
         return []
 
@@ -240,13 +242,17 @@ class ReportQueue:
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         interrupted = bool(data.get("interrupted")) or data.get("completed") is False
         item = self.inflight
+        follow = self.inflight_follow
         disposition = self.disposition
         self.holding = None
         self.inflight = None
+        self.inflight_follow = None
         self.disposition = None
         parked = False
-        if item is not None and disposition == "drop":
-            self.last = item
+        if disposition == "drop":
+            # skip / close wins over barge-in: do not say the line again.
+            if item is not None:
+                self.last = item
         elif item is not None and disposition == "back":
             self._defer(item)
             self.last = item
@@ -256,6 +262,10 @@ class ReportQueue:
             self.items.append(item)
             self._sort()
             self.last = item
+        elif follow is not None and interrupted:
+            # details / pending was cut off. Offer that same line once more.
+            # A replay of this spoken id is ignored above, so it cannot loop.
+            self.followups.insert(0, follow)
         elif item is not None:
             self.last = item
         return self._drain(allow_deferred=not parked)
@@ -295,21 +305,28 @@ class ReportQueue:
         return [brief]
 
     def _emit_followup_now(self, follow: _Followup) -> dict:
+        follow.attempts += 1
+        n = follow.attempts
         if follow.kind == "details":
+            ident = (f"brief-details-{follow.route_id}" if n == 1
+                     else f"brief-details-{follow.route_id}-{n}")
             brief = _brief(
-                id=f"brief-details-{follow.route_id}", ref=follow.route_id,
+                id=ident, ref=follow.route_id,
                 priority=follow.priority, summary=follow.text, text_ref=follow.text_ref,
                 kind="details", item_id=follow.item_id, ts=follow.ts,
             )
         else:
+            ident = (f"brief-pending-{follow.route_id}" if n == 1
+                     else f"brief-pending-{follow.route_id}-{n}")
             brief = _brief(
-                id=f"brief-pending-{follow.route_id}", ref=follow.route_id,
+                id=ident, ref=follow.route_id,
                 priority="info", summary=self._pending_text(), text_ref=follow.route_id,
                 kind="pending", item_id=None, ts=follow.ts,
             )
         self.holding = brief["id"]
         # The report item, if any, was already resolved. This utterance is not one.
         self.inflight = None
+        self.inflight_follow = follow
         return brief
 
     def _pending_text(self) -> str:

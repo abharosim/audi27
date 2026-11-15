@@ -85,12 +85,19 @@ def _wait_quiet(speaking, stop: threading.Event | None, poll_s: float) -> bool:
             time.sleep(poll_s)
 
 
-def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, platform: str | None = None):
+def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, platform: str | None = None,
+                group: bool = False, term_timeout: float = 1.0):
     """`backend(text, voice, stop_check) -> {text, completed, interrupted, backend}`.
 
     `stop_check()` is polled while `say` runs. True kills the process and the
     result is interrupted. A non-zero exit (unknown voice, say missing at
     runtime) is logged instead of retried, so a bad voice cannot spin the queue.
+
+    `group` is off unless presence is on, so the flag-off path still starts
+    `say` in this process's group and waits a second before SIGKILL. With
+    presence on, `say` is its own session: SIGTERM goes to the group immediately
+    and SIGKILL follows after `term_timeout` (0.2 s), including a child that
+    ignored SIGTERM after the leader exited.
     """
     host = sys.platform if platform is None else platform
 
@@ -107,16 +114,18 @@ def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep,
                 return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
         except Exception:
             log.exception("could not read whether the user is speaking")
-        proc = _spawn(popen, ["say", "-v", voice, "--", text])
+        proc = _spawn(popen, ["say", "-v", voice, "--", text], group=group)
         try:
             while True:
+                # Checked again immediately after spawn, before the first sleep,
+                # so speech that starts during process creation is not missed.
                 try:
                     talking = bool(stop_check())
                 except Exception:
                     log.exception("could not read whether the user is speaking")
                     talking = False
                 if talking:
-                    _stop_proc(proc)
+                    _stop_proc(proc, term_timeout)
                     return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
                 if proc.poll() is not None:
                     break
@@ -129,25 +138,30 @@ def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep,
         finally:
             # A signal, a timeout, or the caller giving up must not leave `say` running.
             if proc.poll() is None:
-                _stop_proc(proc)
+                _stop_proc(proc, term_timeout)
 
     return backend
 
 
-def _spawn(popen, argv):
-    """Start `say`. The real process is its own session so a child dies with it."""
-    if popen is not subprocess.Popen:
+def _spawn(popen, argv, *, group: bool):
+    """Start `say`. With `group`, it leads a new session so the group can be signalled."""
+    if not group:
         return popen(argv)
-    proc = popen(argv, start_new_session=True)
-    proc._audi27_group = True  # noqa: SLF001
+    try:
+        proc = popen(argv, start_new_session=True)
+    except TypeError:
+        return popen(argv)
+    if isinstance(getattr(proc, "pid", None), int) and proc.pid > 0:
+        proc._audi27_group = True  # noqa: SLF001
+        proc._audi27_pgid = proc.pid  # noqa: SLF001  setsid: pid is the process group id
     return proc
 
 
 def _signal_proc(proc, sig: int, *, kill: bool) -> None:
-    pid = getattr(proc, "pid", None)
-    if getattr(proc, "_audi27_group", False) and isinstance(pid, int) and pid > 0:
+    pgid = getattr(proc, "_audi27_pgid", None)
+    if getattr(proc, "_audi27_group", False) and isinstance(pgid, int) and pgid > 0:
         try:
-            os.killpg(pid, sig)
+            os.killpg(pgid, sig)
             return
         except OSError:
             pass
@@ -160,30 +174,54 @@ def _signal_proc(proc, sig: int, *, kill: bool) -> None:
         log.exception("could not stop say")
 
 
-def _stop_proc(proc) -> None:
-    """Stop `say`. Terminate, then kill if it is still there, so it is not left running."""
-    # SIGTERM immediately. If it is still alive, SIGKILL before the 0.3 s budget.
+def _stop_proc(proc, term_timeout: float = 1.0) -> None:
+    """Stop `say`. Terminate, then kill if it is still there.
+
+    Without a process group this is the flag-off path: SIGTERM, wait
+    `term_timeout` (1 s), then SIGKILL. With a group (presence on), the signal
+    goes to the whole group, and the group is SIGKILLed even when the leader
+    has already exited so a child that ignored SIGTERM is not left running.
+    """
+    if not getattr(proc, "_audi27_group", False):
+        try:
+            proc.terminate()
+            proc.wait(timeout=term_timeout)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=term_timeout)
+            except Exception:
+                log.exception("could not stop say")
+        return
+    pgid = getattr(proc, "_audi27_pgid", None)
     _signal_proc(proc, signal.SIGTERM, kill=False)
     try:
-        proc.wait(timeout=0.2)
-        return
+        proc.wait(timeout=term_timeout)
     except Exception:
-        pass
-    _signal_proc(proc, signal.SIGKILL, kill=True)
-    try:
-        proc.wait(timeout=0.2)
-    except Exception:
-        log.exception("could not stop say")
+        _signal_proc(proc, signal.SIGKILL, kill=True)
+        try:
+            proc.wait(timeout=term_timeout)
+        except Exception:
+            log.exception("could not stop say")
+    if isinstance(pgid, int) and pgid > 0:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def build_backend(cfg=None):
     """Real `say`. With presence on, poll a little faster than the default 0.1 s.
 
     The file is written on the transition, so a 0.05 s poll keeps the kill
-    inside about 0.3 s. The flag-off path keeps the 0.1 s poll.
+    inside about 0.3 s. The flag-off path keeps the 0.1 s poll and the 1 s
+    SIGKILL grace; it does not put `say` in its own session.
     """
     if cfg is not None and cfg.presence.enabled:
-        return say_backend(sleep=lambda seconds: time.sleep(0.05 if seconds > 0.05 else seconds))
+        return say_backend(
+            sleep=lambda seconds: time.sleep(0.05 if seconds > 0.05 else seconds),
+            group=True, term_timeout=0.2,
+        )
     return say_backend()
 
 

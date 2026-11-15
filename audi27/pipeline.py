@@ -224,7 +224,12 @@ class Pipeline:
         levels: deque = deque(maxlen=64)  # ~2 s of per-frame loudness for the dashboard waveform
         # Presence is the fast path (≤0.1 s). The 0.4 s heartbeat below stays the
         # dashboard's view, and is the speaker's view while [presence] is off.
-        publisher = PresencePublisher(self.store.root, self.cfg.presence) if self.cfg.presence.enabled else None
+        # The event log fsyncs under a lock. Keep that off this loop: the file
+        # is the barge-in signal, and a stalled append must not delay frames.
+        publisher = (
+            PresencePublisher(self.store.root, self.cfg.presence, defer_log=True)
+            if self.cfg.presence.enabled else None
+        )
         presence_error = False
 
         def beat(stopped: bool = False) -> None:

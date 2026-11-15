@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,12 +87,26 @@ class Tracker:
 
 
 def write_presence(data_dir, payload: dict) -> None:
-    """Atomically replace `presence.json`. Readers see the old file or the new one."""
+    """Atomically replace `presence.json`. Readers see the old file or the new one.
+
+    The temp file sits in the same directory as the destination, so `os.replace`
+    is a rename and stays atomic on macOS (a cross-device rename is not). There
+    is no fsync: a reader on this machine sees the page cache, and fsync at the
+    publish rate would stall the recorder. A failed replace deletes the temp
+    file; the previous `presence.json` is left in place.
+    """
     root = Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / (FILENAME + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, root / FILENAME)
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, root / FILENAME)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_presence(data_dir) -> dict | None:
@@ -117,7 +133,11 @@ def _number(value) -> float | None:
 
 
 def fresh(data: dict | None, now: float, stale_s: float) -> bool:
-    """True when `updated` is a believable timestamp within `stale_s`."""
+    """True when `updated` is a believable wall-clock timestamp within `stale_s`.
+
+    `updated` and `now` are both `time.time()`. A monotonic clock cannot be
+    compared with a timestamp another process wrote.
+    """
     if not isinstance(data, dict):
         return False
     updated = _number(data.get("updated"))
@@ -151,9 +171,16 @@ def busy(data_dir, cfg, now: float | None = None) -> bool:
 
 
 class PresencePublisher:
-    """Turns per-frame speech bits into the file and, on change, one event."""
+    """Turns per-frame speech bits into the file and, on change, one event.
 
-    def __init__(self, data_dir, cfg, *, clock=None, append_fn=None):
+    The file is replaced on this thread, before the event is appended. The
+    event log takes an exclusive lock and fsyncs; with `defer_log` that work
+    runs on a side thread so a slow disk cannot stall the frame loop or delay
+    the file the speaker reads. `tick` and `close` swallow errors: a presence
+    failure must not kill the recorder.
+    """
+
+    def __init__(self, data_dir, cfg, *, clock=None, append_fn=None, defer_log=False):
         self.root = Path(data_dir)
         self.cfg = cfg
         self.clock = clock or time.time
@@ -163,47 +190,106 @@ class PresencePublisher:
         self._since: float | None = None
         self._raw = False
         self._io_error = False
+        self._q: queue.Queue | None = None
+        self._log_thread: threading.Thread | None = None
+        if defer_log:
+            self._q = queue.Queue()
+            self._log_thread = threading.Thread(
+                target=self._drain_log, name="audi27-presence-log", daemon=True)
+            self._log_thread.start()
 
     def tick(self, speech: bool, now: float | None = None):
         """Observe one frame. Returns the presence event when the state changed."""
+        try:
+            return self._tick(bool(speech), now)
+        except Exception:
+            self._log_io("presence update failed")
+            return None
+
+    def _tick(self, speech: bool, now: float | None):
         now = self.clock() if now is None else float(now)
         prev = self.tracker._last_now
         jumped = prev is not None and now < prev - _SKEW_S
-        changed = self.tracker.observe(bool(speech), now)
-        self._raw = bool(speech)
+        changed = self.tracker.observe(speech, now)
+        self._raw = speech
         if jumped and self._since is not None and self._since > now + _SKEW_S:
             # The old `since` is in the future relative to the new clock.
             self._since = now if self.tracker.state == "speaking" else None
-        event = None
         if changed is not None:
             self._since = now
-            event = self._emit(changed, now)
         due = self._last_write is None or now - self._last_write >= self.cfg.publish_s
         if changed is not None or due or jumped:
             self._write(now)
-        return event
+        if changed is None:
+            return None
+        return self._emit(changed, now)
 
     def close(self, now: float | None = None):
         """If speech was open, record quiet. A clean stop should not stick on speaking."""
-        now = self.clock() if now is None else float(now)
-        if self.tracker.state != "speaking":
-            return None
-        self.tracker.state = "quiet"
-        self._raw = False
-        self._since = now
-        event = self._emit("quiet", now)
-        self._write(now)
+        event = None
+        try:
+            now = self.clock() if now is None else float(now)
+            if self.tracker.state == "speaking":
+                self.tracker.state = "quiet"
+                self._raw = False
+                self._since = now
+                self._write(now)
+                event = self._emit("quiet", now)
+        except Exception:
+            self._log_io("presence was not closed")
+            event = None
+        self.flush()
+        self._stop_log()
         return event
+
+    def flush(self, timeout: float = 2.0) -> None:
+        """Wait until queued presence events have been appended, or `timeout` elapses."""
+        if self._q is None:
+            return
+        deadline = time.monotonic() + timeout
+        while self._q.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    def _stop_log(self) -> None:
+        thread = self._log_thread
+        if thread is None or self._q is None:
+            return
+        self._log_thread = None
+        self._q.put(None)
+        thread.join(timeout=1.0)
+
+    def _drain_log(self) -> None:
+        assert self._q is not None
+        while True:
+            event = self._q.get()
+            try:
+                if event is None:
+                    return
+                try:
+                    self.append_fn(self.root, event)
+                except Exception:
+                    self._log_io("presence event was not written")
+                else:
+                    self._io_error = False
+            finally:
+                self._q.task_done()
 
     def _emit(self, state: str, now: float):
         try:
             ts = datetime.fromtimestamp(now).astimezone()
         except (OverflowError, OSError, ValueError):
             ts = None
-        event = make_event("presence", PRESENCE_SOURCE, {"state": state}, ts=ts)
+        try:
+            event = make_event("presence", PRESENCE_SOURCE, {"state": state}, ts=ts)
+        except Exception:
+            self._log_io("presence event was not written")
+            return None
+        if self._q is not None:
+            self._q.put(event)
+            return event
         try:
             self.append_fn(self.root, event)
-        except OSError:
+        except Exception:
             self._log_io("presence event was not written")
             return None
         self._io_error = False
@@ -218,7 +304,7 @@ class PresencePublisher:
         }
         try:
             write_presence(self.root, payload)
-        except OSError:
+        except Exception:
             self._log_io("presence file was not written")
             return
         self._io_error = False

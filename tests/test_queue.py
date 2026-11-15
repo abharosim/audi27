@@ -222,8 +222,75 @@ def test_close_discards_everything_still_queued():
 def test_an_interrupted_brief_is_spoken_again():
     queue = ReportQueue()
     queue.push_all([reply("a", "甲。")])
-    out = queue.push_all([spoken("brief-a", interrupted=True, completed=False)])
+    sp = spoken("brief-a", interrupted=True, completed=False)
+    out = queue.push_all([sp])
     assert out[0]["id"] == "brief-a-2" and out[0]["data"]["text_ref"] == "a"
+    # The same spoken event must not mint another copy. While the user is still
+    # talking there is no further spoken event, so the re-offer stays in flight.
+    assert queue.push_all([sp]) == []
+    assert queue.holding == "brief-a-2" and queue.items == []
+    rebuilt = ReportQueue()
+    again = rebuilt.push_all([reply("a", "甲。"), sp])
+    assert [b["id"] for b in again] == ["brief-a", "brief-a-2"]
+    assert rebuilt.holding == queue.holding and rebuilt.items == []
+
+
+def test_skip_and_later_and_close_beat_barge_in():
+    skipped = ReportQueue()
+    skipped.push_all([reply("a", "甲。"), reply("b", "乙。")])
+    skipped.push_all([command("s", "skip")])
+    out = skipped.push_all([spoken("brief-a", interrupted=True, completed=False)])
+    assert [b["data"]["text_ref"] for b in out] == ["b"]
+    assert [it.id for it in skipped.items] == []
+
+    later = ReportQueue()
+    later.push_all([reply("a", "甲。"), reply("b", "乙。")])
+    later.push_all([command("l", "later")])
+    out = later.push_all([spoken("brief-a", interrupted=True, completed=False)])
+    assert [b["data"]["text_ref"] for b in out] == ["b"]
+    assert [it.id for it in later.items] == ["a"] and later.items[0].deferred
+    # The only item, deferred, is not said again until something else arrives.
+    only = ReportQueue()
+    only.push_all([reply("a", "甲。")])
+    only.push_all([command("l", "later")])
+    assert only.push_all([spoken("brief-a", interrupted=True, completed=False)]) == []
+    assert [it.id for it in only.items] == ["a"] and only.items[0].deferred
+
+    closed = ReportQueue()
+    closed.push_all([reply("a", "甲。"), reply("b", "乙。")])
+    closed.push_all([command("c", "close")])
+    assert closed.push_all([spoken("brief-a", interrupted=True, completed=False)]) == []
+    assert closed.items == [] and closed.holding is None
+
+
+def test_an_interrupted_details_or_pending_line_is_reoffered_once():
+    text = "第一句。第二句全文。"
+    queue = ReportQueue()
+    first = queue.push_all([reply("a", text)])
+    details = queue.push_all([command("d", "details"), spoken(first[0]["id"])])
+    assert details[0]["id"] == "brief-details-d" and details[0]["data"]["summary"] == text
+    sp = spoken(details[0]["id"], interrupted=True, completed=False)
+    out = queue.push_all([sp])
+    assert out[0]["id"] == "brief-details-d-2" and out[0]["data"]["summary"] == text
+    assert queue.push_all([sp]) == []
+    assert queue.push_all([spoken(out[0]["id"])]) == []
+    assert queue.holding is None and queue.items == []
+
+    pending_q = ReportQueue()
+    pending_q.push_all([reply("a", "甲。"), reply("b", "乙。")])
+    pending = pending_q.push_all([command("p", "pending"), spoken("brief-a")])
+    again = pending_q.push_all([spoken(pending[0]["id"], interrupted=True, completed=False)])
+    assert again[0]["id"] == "brief-pending-p-2" and again[0]["data"]["kind"] == "pending"
+    nxt = pending_q.push_all([spoken(again[0]["id"])])
+    assert nxt[0]["data"]["text_ref"] == "b"
+
+    # close during the details line drops it, even if that line is then interrupted.
+    dropped = ReportQueue()
+    first = dropped.push_all([reply("a", text)])
+    details = dropped.push_all([command("d", "details"), spoken(first[0]["id"])])
+    assert dropped.push_all([command("c", "close")]) == []
+    assert dropped.push_all([spoken(details[0]["id"], interrupted=True, completed=False)]) == []
+    assert dropped.holding is None and dropped.items == []
 
 
 def test_replaying_the_same_events_rebuilds_the_same_briefs():
