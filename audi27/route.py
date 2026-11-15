@@ -8,7 +8,8 @@ the next turn without a restart.
 
 Decision order, first match wins:
 
-1. an agent name in the text (发给 Muse / Cloud Code / 本地模型 / …)
+1. an agent name in the text (发给 Muse / Cloud Code / 本地模型 / …),
+   unless that name is explicitly negated (别用 / 不要用 / don't use)
 2. a queue-control phrase that is the whole turn (跳过, 详细说说, …),
    including a repeat of that same phrase
 3. a whole-turn "not a command" phrase (算了, 不用了, …) -> target `none`,
@@ -70,6 +71,13 @@ _POLITE = ("请帮我", "帮我", "麻烦你", "麻烦", "请你", "请", "pleas
 # Spoken Chinese puts one of these between a verb and its object: 推一下代码, 发封邮件.
 _CONFIRM_GAP = "(?:一下子|一下|一个|一封|个|封)?"
 _LABEL_PUNCT = "。.`\"'“”「」『』,，！!？?；;:：()（）[]【】"
+# Longer alternative first. The name itself is not part of the match: the
+# prefix must end on the negation, so "用 Claude Code" still addresses it
+# and "不要用" is not swallowed by the shorter "别用".
+_NEGATED_TAIL = re.compile(
+    r"(?:不要用|别用|do\s+not\s+use|don't\s+use|dont\s+use)\s*$",
+    re.IGNORECASE,
+)
 
 _LABEL = {
     "grok": "Grok",
@@ -467,17 +475,35 @@ class _Hit:
     addressed: bool
 
 
-def _find_agent(text: str, rules: Rules) -> _Hit | None:
+def _is_negated(prefix: str) -> bool:
+    """True when `prefix` ends with 别用 / 不要用 / don't use (optional space before the name)."""
+    text = unicodedata.normalize("NFKC", prefix).replace("\u2019", "'").rstrip()
+    return _NEGATED_TAIL.search(text) is not None
+
+
+def _split_agents(text: str, rules: Rules) -> tuple[_Hit | None, set[str]]:
+    """Positive name hits, plus targets whose every mention is negated.
+
+    A negated mention is not a candidate. "别用 Claude Code，问 Muse" keeps Muse.
+    A target that is only ever negated (别用 Grok, and Grok is also the default)
+    is returned in the blocked set so a later rule cannot select it either.
+    """
     hits = []
+    flags: dict[str, list[bool]] = {}
     for target, pattern in rules.agents:
         for match in pattern.finditer(text):
+            negated = _is_negated(text[:match.start()])
+            flags.setdefault(target, []).append(negated)
+            if negated:
+                continue
             hits.append(_Hit(target, match.start(), match.end(),
                              _verb_before(text[:match.start()], rules.address) is not None))
+    blocked = {target for target, seen in flags.items() if seen and all(seen)}
     if not hits:
-        return None
+        return None, blocked
     # An addressed name beats a bare mention. Otherwise the earliest, then the longest
     # (grok bot rather than the grok inside it).
-    return max(hits, key=lambda h: (h.addressed, -h.start, h.end - h.start))
+    return max(hits, key=lambda h: (h.addressed, -h.start, h.end - h.start)), blocked
 
 
 def _starts_with_polite(body: str) -> bool:
@@ -576,6 +602,8 @@ def needs_confirmation(text: str, rules: Rules) -> bool:
 
 
 def _reason(rule: str) -> str:
+    if rule.startswith("negated:"):
+        return "点名排除了 " + _LABEL.get(rule.split(":", 1)[1], rule.split(":", 1)[1])
     if rule.startswith("explicit:"):
         return "点名了 " + _LABEL.get(rule.split(":", 1)[1], rule.split(":", 1)[1])
     if rule.startswith("keyword:"):
@@ -631,29 +659,39 @@ def decide(text: str, rules: Rules, *, classify=None, timeout_s: float = 8.0) ->
     if _compact(norm) == "":
         return done("none", "", "empty", "rule")
 
-    hit = _find_agent(norm, rules)
+    hit, blocked = _split_agents(norm, rules)
+
+    def finish(decision: Decision) -> Decision:
+        # "别用 Grok" must not fall through to the default and select Grok anyway.
+        if decision.target not in blocked:
+            return decision
+        rule = f"negated:{decision.target}"
+        return Decision("none", decision.text, decision.turn_text, rule, _reason(rule), "rule",
+                        decision.needs_confirmation, None)
+
     if hit is not None:
-        return done(hit.target, _message(norm, hit.start, hit.end, rules.address), f"explicit:{hit.target}", "rule")
+        return finish(done(hit.target, _message(norm, hit.start, hit.end, rules.address),
+                           f"explicit:{hit.target}", "rule"))
 
     command = _match_phrase(_compact(norm), rules.queue, mix=False)
     if command is not None:
-        return done("queue", _collapse(norm), f"queue:{command}", "rule", command)
+        return finish(done("queue", _collapse(norm), f"queue:{command}", "rule", command))
 
     whole = _match_phrase(_compact(norm), rules.whole, mix=True)
     if whole is not None:
-        return done("none", _collapse(norm), f"none:{whole}", "rule")
+        return finish(done("none", _collapse(norm), f"none:{whole}", "rule"))
 
     folded = norm.casefold()
     for name, target, words in rules.keywords:
         if any(_has(folded, word) for word in words):
-            return done(target, _collapse(norm), f"keyword:{name}", "rule")
+            return finish(done(target, _collapse(norm), f"keyword:{name}", "rule"))
 
     if classify is not None:
         label = _parse_label(_within(lambda: classify(norm), timeout_s))
         if label is not None:
-            return done(label, _collapse(norm), "llm", "llm")
+            return finish(done(label, _collapse(norm), "llm", "llm"))
 
-    return done(rules.default, _collapse(norm), "default", "default")
+    return finish(done(rules.default, _collapse(norm), "default", "default"))
 
 
 def route_id(turn_id: str) -> str:

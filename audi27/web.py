@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import config as C
 from . import evals as E
+from .events import replay
 from .route import list_routes, save_route_verdict
 from .status import read_status
 from .store import clean_json, parse_when, search
@@ -163,6 +164,11 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                     if limit < 1 or limit > 1000:
                         raise ValueError("limit must be 1..1000")
                     self._json(list_routes(root, limit=limit))
+                elif url.path == "/api/loop":
+                    limit = int(q.get("limit", 200))
+                    if limit < 1 or limit > 1000:
+                        raise ValueError("limit must be 1..1000")
+                    self._json(list_loop(root, limit=limit))
                 elif url.path.startswith("/audio/"):
                     self._audio(unquote(url.path[len("/audio/"):]))
                 else:
@@ -237,6 +243,36 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
             self._send(200, data, "audio/wav", {"Accept-Ranges": "bytes"})
 
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def list_loop(root, *, limit: int = 200) -> dict:
+    """Recent task / reply / brief / spoken events, newest first. Read-only."""
+    rows = []
+    for ev in replay(root):
+        if ev.get("type") not in ("task", "reply", "brief", "spoken"):
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if ev["type"] == "task":
+            summary = " ".join(str(x) for x in (data.get("status"), data.get("target"),
+                                                data.get("error") or data.get("text") or "") if x)
+        elif ev["type"] == "reply":
+            summary = data.get("text") or ""
+        elif ev["type"] == "brief":
+            summary = f"[{data.get('priority') or ''}] {data.get('summary') or ''}"
+        else:
+            flag = "interrupted" if data.get("interrupted") else "completed" if data.get("completed") else ""
+            summary = " ".join(x for x in (flag, data.get("text") or "") if x)
+        text = " ".join(str(summary).split())
+        if len(text) > 240:
+            text = text[:239] + "…"
+        rows.append({
+            "id": ev["id"], "ts": ev.get("ts"), "type": ev["type"],
+            "ref": ev.get("ref"), "summary": text,
+        })
+    if limit > 0:
+        rows = rows[-limit:]
+    rows.reverse()
+    return {"events": rows}
 
 
 def serve(data_dir: str | Path, host: str, port: int, config_path: str | None = None) -> None:

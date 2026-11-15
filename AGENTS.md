@@ -70,12 +70,30 @@ Utterances are merged by audio time, not file order: a retried segment or a back
 
 ## Routes
 
-`audi27 route` reads `turn` events and writes one `route` (`id` = `route-<turn id>`, `ref` = the turn id). It does not message any agent. Rules are `routes.toml` when that file exists, otherwise `routes.example.toml`, re-read on every turn. Explicit agent names win (including ASR spellings such as Cloud Code and grog), then a whole-turn queue command (`command`: details / skip / later / pending / close), then a whole-turn "not a command" (`target` `none`), then keyword rules (career topics → muse), then the default (grok). Claude Code and the local model are chosen only when named. `[route] llm = true` asks the corrector's local model about leftovers, with `timeout_s` and a fallback to the default; tests inject `classify`. `needs_confirmation` is a keyword hit for send-email / pay / delete / push / post. The dashboard 路由 tab stores ✓/✗ in `data/route_verdicts.jsonl` (last line per id wins) and shows the running accuracy. Replay prints only; `--write` appends. The first `route run` starts at the end of the stream (`data/route.cursor.json`). `[route] enabled = true` (default off) starts it from `audi27 supervise`; turns need to be enabled too or there is nothing to route.
+`audi27 route` reads `turn` events and writes one `route` (`id` = `route-<turn id>`, `ref` = the turn id). It does not message any agent. Rules are `routes.toml` when that file exists, otherwise `routes.example.toml`, re-read on every turn. Explicit agent names win (including ASR spellings such as Cloud Code and grog), then a whole-turn queue command (`command`: details / skip / later / pending / close), then a whole-turn "not a command" (`target` `none`), then keyword rules (career topics → muse), then the default (grok). A name immediately after 别用 / 不要用 / don't use is not a selection; if the fallback target is itself one of those negated names (别用 Grok), the route is `none` with rule `negated:<target>`. Claude Code and the local model are chosen only when named. `[route] llm = true` asks the corrector's local model about leftovers, with `timeout_s` and a fallback to the default; tests inject `classify`. `needs_confirmation` is a keyword hit for send-email / pay / delete / push / post. The dashboard 路由 tab stores ✓/✗ in `data/route_verdicts.jsonl` (last line per id wins) and shows the running accuracy. Replay prints only; `--write` appends. The first `route run` starts at the end of the stream (`data/route.cursor.json`). `[route] enabled = true` (default off) starts it from `audi27 supervise`; turns need to be enabled too or there is nothing to route.
 
 ```bash
 uv run audi27 route test "帮我问一下 Muse 下个月面试怎么准备"
 uv run audi27 route replay --since today --json   # print only; add --write to append
 uv run audi27 route run
+```
+
+## Dispatch, queue, speaker
+
+These three close the loop and default to off (`[dispatch]`, `[queue]`, `[speak]` `enabled`). `audi27 supervise` / `start.sh` starts one only when its flag is on. Each `run` command executes even when the flag is off, same as turns and route. Modules only pass events: route → task/reply → brief → spoken. `ref` links each one to the previous, so `audi27 events chain` on a `spoken` id walks back to the utterance.
+
+`audi27 dispatch run` hands a `route` to the adapter named by `[dispatch.adapters]` (missing targets use `fake`). Targets `none` and `queue` are not dispatched. `needs_confirmation` writes one `task` with status `awaiting_confirmation` and does not call the adapter. `fake` echoes `收到：…`, sleeps `[fake] delay_s`, fails with no reply when the text contains `fail_marker` (default 模拟失败), and sets `needs_decision` when it contains `decision_marker` (default 需要你决定). A future adapter implements `Agent.handle(route, emit)` and emits `sent`, `running`, then `done` plus a `reply`, or `failed`. The first live start does not backfill (`data/dispatch.cursor.json`).
+
+`audi27 queue run` turns a `reply` (and a `task` with status `failed`) into a `brief`: priority `decision` > `error` > `done` > `info`, a one-sentence summary (first sentence, truncated to `[queue] summary_chars`; pass `summarize_fn` later for an LLM, it is not called now), and `text_ref` pointing at the full text. One brief is released at a time; the next waits for `spoken`. A queue-target route runs a command: `details` (full text of the current or last item), `skip`, `later` (back of the queue), `pending` (one line listing what is left), `close`. Replaying the log rebuilds the queue; there is no second store. `audi27 queue show` prints that fold and writes nothing. The first `queue run` does not brief history; a restart replays from the epoch stored in `data/queue.cursor.json`.
+
+`audi27 speak run` speaks briefs in log order with macOS `say` (`[speak] voice`, default `Tingting`). It writes `spoken` (`text`, `completed`, `interrupted`, `backend`). It will not start while `data/status.json` says `speaking`, and it kills `say` if that becomes true mid-sentence. The recorder writes that flag about every 0.4 s, which is slower than the 0.2 s the design wants. Where `say` is missing, the line is logged (`backend` `log`) and the process does not crash. `say` does not report partial progress; `text` is the whole line it was given. `audi27 speak test "文字"` speaks one line and prints the result; it does not write an event. The first live start does not read old briefs.
+
+```bash
+uv run audi27 dispatch run
+uv run audi27 queue show
+uv run audi27 queue run
+uv run audi27 speak test "你好"
+uv run audi27 speak run
 ```
 
 ## Replays

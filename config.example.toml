@@ -98,6 +98,39 @@ rules = "routes.toml"
 llm = false             # true: leftovers go to the [correct] local model; timeout or a bad answer uses default
 timeout_s = 8.0
 
+# Execution. Off by default: routes are only displayed until this is turned on.
+# `enabled` starts `audi27 dispatch run` from start.sh. Every target uses the
+# fake adapter until a real one is configured. none/queue are never dispatched.
+# needs_confirmation writes a task (awaiting_confirmation) and does not call the adapter.
+[dispatch]
+enabled = false
+
+[dispatch.adapters]
+grok = "fake"
+muse = "fake"
+claude_code = "fake"
+local = "fake"
+
+# The fake adapter echoes the route text. A route whose text contains the marker
+# fails, or comes back as a reply that needs a decision. delay_s is seconds.
+[fake]
+delay_s = 0.0
+fail_marker = "模拟失败"
+decision_marker = "需要你决定"
+
+# Report queue. `enabled` starts `audi27 queue run` from start.sh.
+# The first start does not brief history; a restart replays from that point.
+[queue]
+enabled = false
+summary_chars = 80
+
+# Speaker. `enabled` starts `audi27 speak run` from start.sh.
+# voice is passed to macOS `say` (Tingting is zh_CN; older macOS: Ting-Ting).
+# Where `say` is missing the line is logged. The first start does not read history.
+[speak]
+enabled = false
+voice = "Tingting"
+
 [store]
 data_dir = "data"
 # "all" | "suspect" (only suspect+rejected) | "none". Replay/eval and playback need the audio:

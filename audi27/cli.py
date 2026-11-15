@@ -124,7 +124,9 @@ def cmd_supervise(args, cfg) -> int:
 
     _setup_logging(Path(cfg.store.data_dir), args.verbose)
     supervisor.main(args.config, cfg.store.data_dir, args.host, args.port,
-                    turns=cfg.turns.enabled, route=cfg.route.enabled)
+                    turns=cfg.turns.enabled, route=cfg.route.enabled,
+                    dispatch=cfg.dispatch.enabled, queue=cfg.queue.enabled,
+                    speak=cfg.speak.enabled)
     return 0
 
 
@@ -276,6 +278,64 @@ def cmd_route(args, cfg) -> int:
     return 0
 
 
+def cmd_dispatch(args, cfg) -> int:
+    from .dispatch import serve
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def cmd_queue(args, cfg) -> int:
+    from .queue import format_queue, load_state, serve
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    if args.queue_cmd == "show":
+        print(format_queue(load_state(data_dir, cfg)), flush=True)
+        return 0
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def cmd_speak(args, cfg) -> int:
+    from .speak import serve, speak_text, user_speaking
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    if args.speak_cmd == "test":
+        result = speak_text(args.text, cfg, speaking=lambda: user_speaking(data_dir))
+        print(f"{result.get('backend', 'log')}: {result.get('text', '')}", flush=True)
+        return 0
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_search(args, cfg) -> int:
     data_dir = args.data_dir or cfg.store.data_dir
     try:
@@ -369,6 +429,28 @@ def main(argv=None) -> int:
     rtest.add_argument("text")
     rtest.add_argument("--json", action="store_true")
     rp.set_defaults(fn=cmd_route)
+    dp = sub.add_parser("dispatch", help="send route events to the configured agent adapter")
+    dsub = dp.add_subparsers(dest="dispatch_cmd", required=True)
+    drun = dsub.add_parser("run", help="follow route events and emit task/reply events")
+    drun.add_argument("--data-dir")
+    drun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    dp.set_defaults(fn=cmd_dispatch)
+    qp = sub.add_parser("queue", help="turn replies into briefs and apply queue commands")
+    qsub = qp.add_subparsers(dest="queue_cmd", required=True)
+    qrun = qsub.add_parser("run", help="follow the event stream and emit brief events")
+    qrun.add_argument("--data-dir")
+    qrun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    qshow = qsub.add_parser("show", help="print the queue rebuilt from the event log")
+    qshow.add_argument("--data-dir")
+    qp.set_defaults(fn=cmd_queue)
+    sp = sub.add_parser("speak", help="speak brief events; logs the line where say is unavailable")
+    ssub = sp.add_subparsers(dest="speak_cmd", required=True)
+    srun = ssub.add_parser("run", help="follow brief events and emit spoken events")
+    srun.add_argument("--data-dir")
+    srun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    stest = ssub.add_parser("test", help="speak one line and print what the backend did")
+    stest.add_argument("text")
+    sp.set_defaults(fn=cmd_speak)
     e = sub.add_parser("eval", help="replay stored audio through other backends and compare")
     e.add_argument("--data-dir")
     esub = e.add_subparsers(dest="eval_cmd", required=True)
