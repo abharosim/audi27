@@ -270,27 +270,17 @@ def post_webhook(url: str, payload: dict, *, header_name: str, header_value: str
     raise last
 
 
-def screen_from_route(route: dict) -> dict | None:
-    """App and title stored on the route, or None. A redacted title is not forwarded."""
+def screen_from_route(route: dict, exclude_apps=()) -> dict | None:
+    """App and title stored on the route, or None. A redacted or excluded title is not forwarded."""
+    from .screen import _excluded, public_context
+
     data = route.get("data") if isinstance(route.get("data"), dict) else {}
-    screen = data.get("screen")
-    if not isinstance(screen, dict):
+    view = public_context(data.get("screen"))
+    if view is None:
         return None
-    app = screen.get("app")
-    if not isinstance(app, str) or not app.strip():
-        return None
-    bundle = screen.get("bundle_id") if isinstance(screen.get("bundle_id"), str) else ""
-    title = screen.get("title")
-    if screen.get("title_redacted") or not isinstance(title, str):
-        title = None
-    else:
-        title = " ".join("".join(ch if ch.isprintable() else " " for ch in title).split())
-    return {
-        "app": app.strip()[:200],
-        "bundle_id": bundle.strip()[:200],
-        "title": title,
-        "title_redacted": bool(screen.get("title_redacted")),
-    }
+    if _excluded(view["app"], view["bundle_id"], exclude_apps):
+        return {**view, "title": None, "title_redacted": True}
+    return view
 
 
 def recent_utterances(data_dir, n: int) -> list[str]:
@@ -314,7 +304,8 @@ class GrokbotAgent(Agent):
     name = ADAPTER
 
     def __init__(self, *, data_dir, url: str, key: str, header_name: str, header_value: str,
-                 timeout_s: float, context_utterances: int, include_screen: bool = False):
+                 timeout_s: float, context_utterances: int, include_screen: bool = False,
+                 exclude_apps=()):
         self.data_dir = str(data_dir)
         self.url = url
         self.key = key
@@ -323,10 +314,13 @@ class GrokbotAgent(Agent):
         self.timeout_s = float(timeout_s)
         self.context_utterances = int(context_utterances)
         self.include_screen = bool(include_screen)
+        self.exclude_apps = tuple(exclude_apps or ())
 
     @classmethod
     def from_cfg(cls, cfg) -> "GrokbotAgent":
         g = cfg.grokbot
+        screen = getattr(cfg, "screen", None)
+        names = tuple(getattr(screen, "exclude_apps", ()) or ()) if screen is not None else ()
         return cls(
             data_dir=cfg.store.data_dir,
             url=os.environ.get(_URL_ENV, ""),
@@ -336,6 +330,7 @@ class GrokbotAgent(Agent):
             timeout_s=g.timeout_s,
             context_utterances=g.context_utterances,
             include_screen=g.include_screen,
+            exclude_apps=names,
         )
 
     def _context(self, route: dict):
@@ -347,7 +342,7 @@ class GrokbotAgent(Agent):
         for callers that did not ask for screen context.
         """
         texts = recent_utterances(self.data_dir, self.context_utterances) if self.context_utterances > 0 else None
-        screen = screen_from_route(route) if self.include_screen else None
+        screen = screen_from_route(route, self.exclude_apps) if self.include_screen else None
         if screen is None:
             return texts
         body = {"screen": screen}

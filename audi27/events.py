@@ -32,6 +32,7 @@ from .store import clean_json, iter_records
 # Documented types from the voice-secretary design. Not a whitelist.
 KNOWN_TYPES = frozenset({
     "utterance", "screen", "presence", "turn", "route", "task", "reply", "brief", "spoken",
+    "confirm",
 })
 UTTERANCE_SOURCE = "transcribe"
 _FIELDS = ("id", "ts", "type", "source", "ref", "data")

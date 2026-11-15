@@ -44,6 +44,7 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 dispatch run` | 把 route 交给适配器，写出 `task` / `reply`（默认关） |
 | `audi27 queue run` | 跟着回复，按优先级写 `brief` |
 | `audi27 queue show` | 用事件流重算队列，只打印 |
+| `audi27 confirm run` | 跟事件流，把确认或取消写成 `confirm`（`[confirm]` 关着就不写） |
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
 | `audi27 screen run` | 记录最前面的应用和窗口标题（默认关，仅 macOS 真正采样） |
@@ -55,7 +56,7 @@ uv run pytest                        # 不需要麦克风和模型
 
 ## 事件流
 
-模块之间只追加写入 `data/events/YYYY-MM-DD.jsonl`（本地日期，一行一个 JSON）。固定字段：`id`、`ts`（带时区）、`type`、`source`、`ref`（引起它的事件，没有则为 null）、`data`。已知类型：`utterance`、`screen`、`presence`、`turn`、`route`、`task`、`reply`、`brief`、`spoken`。不认识的类型也会原样保存，读的时候不要拒绝。
+模块之间只追加写入 `data/events/YYYY-MM-DD.jsonl`（本地日期，一行一个 JSON）。固定字段：`id`、`ts`（带时区）、`type`、`source`、`ref`（引起它的事件，没有则为 null）、`data`。已知类型：`utterance`、`screen`、`presence`、`turn`、`route`、`task`、`reply`、`brief`、`spoken`、`confirm`。不认识的类型也会原样保存，读的时候不要拒绝。
 
 ```bash
 uv run audi27 events replay --since 2h --type utterance
@@ -105,13 +106,14 @@ uv run audi27 route run                           # 常驻写 route
 
 这三步把回路接上，但默认都不执行。`[dispatch] enabled`、`[queue] enabled`、`[speak] enabled` 都是 `false`，`./start.sh` 不会拉起它们。路由继续只显示。要跑的时候再开，或者手动执行下面的命令。
 
-- **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器；口头确认留到后面。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
+- **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器。`[confirm]` 关着时这条就停在那里。开着时，只有事后的 `confirm`（`approve`）才会把原来的 route 交给适配器，而且只交一次；`reject` 写成 `cancelled`；超过 `ttl_s`（默认 600 秒）写成 `expired`，不再执行。过期之后的同意不执行，并写一条 brief 说「这条确认已经过期，没有执行。」读回之前的「确认」不能批准。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
 - **Grok Bot** 没有 SDK。只有 `[dispatch.adapters]` 里写了 `grok = "grokbot"` 才会真的发出去，默认仍是 `fake`。`dispatch run` 在 POST 之前先写 `task`（`sent`），JSON 体是 `task_id`、`route_id`、`text`（分给 Grok 的那句）、`ts`，可选 `context`（最近几条 utterance，`context_utterances`，默认 0 不带）。超时约 10 秒，只有网络错误重试一次；非 2xx 记失败。URL 和密钥不进 `config.toml`，放环境变量或项目根的 `.env`（已 gitignore）：`AUDI27_GROKBOT_WEBHOOK_URL`、`AUDI27_GROKBOT_WEBHOOK_KEY`。默认请求头是 `Authorization: Bearer <key>`。Grok Bot 要的头还没定，改 `[grokbot]` 的 `header_name` 和 `header_value`，模板里的 `{key}` 会换成那个密钥，例如 `header_name = "X-Webhook-Key"`、`header_value = "{key}"`。做完后它把回复写到 `data/inbox/grokbot/<task_id>.json`（`{"task_id","route_id","status":"done"|"failed"|"needs_decision","summary","text"}`）。`done` 是普通回复，`needs_decision` 进队列的 decision，`failed` 记一条失败（队列里是 error）。同一 `task_id` 不会重复写事件。格式不对、或不认识的 `task_id`，移到 `inbox/grokbot/quarantine/` 并在日志里记一条错误。JSON 解析失败先留着，连着几个 tick 还不行再隔离。超过 `reply_timeout_s`（默认 1800 秒）还没有回复，失败原因是「Grok Bot 没有回复」；超时之后文件才到，仍然写 reply。`dispatch run` 会一起看这个目录，所以不用再开一个进程；也可以单独跑 `audi27 grokbot inbox`。`audi27 grokbot test "文本"` 发一条测试 POST，打印 HTTP 状态码。密钥和 URL 不会出现在日志或事件里。回复会去掉控制字符，正文最长 4000 字。inbox 里的符号链接不跟随，超过 1MB 的文件直接隔离。对方一直写响应体时，等待不超过 `timeout_s`。
-- **队列** `audi27 queue run` 把 `reply` 和失败的 `task` 收成 `brief`。优先级是 decision > error > done > info。一次只放出一条，等 `spoken` 之后才放下一条；已经在念的不会被后来的更高优先级打断。摘要是第一句，超长截断；`summarize_fn` 是以后接模型的钩子，现在不调用。队列指令（target `queue`）：详细说说念全文，跳过丢掉当前条，稍后放到队尾，还有什么列剩下的，关掉清空。状态靠重放事件恢复，不另存一份。`audi27 queue show` 重放整段日志并打印，不写 brief。`queue run` 第一次启动不汇报历史，重启从那次的位置重放。
+- **队列** `audi27 queue run` 把 `reply` 和失败的 `task` 收成 `brief`。优先级是 decision > error > done > info。`[confirm]` 开着时，`awaiting_confirmation` 也变成一条 decision brief：发给谁、一句转述，然后问「确认还是取消？」。一次只放出一条，等 `spoken` 之后才放下一条；已经在念的不会被后来的更高优先级打断。摘要是第一句，超长截断；`summarize_fn` 是以后接模型的钩子，现在不调用。队列指令（target `queue`）：详细说说念全文，跳过丢掉当前条，稍后放到队尾，还有什么列剩下的，关掉清空。状态靠重放事件恢复，不另存一份。`audi27 queue show` 重放整段日志并打印，不写 brief。`queue run` 第一次启动不汇报历史，重启从那次的位置重放。
+- **确认** `[confirm] enabled` 默认关。开着时 `audi27 confirm run` 只写 `confirm` 事件，不调用适配器。跟在读回后面的达达一轮里，整句就是确认 / 好的 / 可以 / 发吧 / 执行 / yes / ok 才算同意，取消 / 算了 / 不要 / 别 / no 才算取消。问句（吗、呢、问号）、否定（不确认、不可以）、以及「那就好」「好的我想想」这种夹在别的话里的词，都不算同意。英文单词里的 ok（book）也不算。没带触发词的回答只在读回之后的 `window_s`（默认 20 秒）内算数，而且不能落在播报期间或播报结束后的 0.5 秒里（那是自己的回声）。读回之前说的「确认」不能批准。含糊的达达一轮（嗯、又要又不要）会再问一次，然后再含糊就继续挂着；窗口里没有触发词、又不是清楚的同意或取消，就当没听见。没点名时只针对最近一条；点名要对上恰好一条，对上两条就不执行。永远不会因为超时自动同意。同一时刻又同意又取消，按取消。仪表盘回路里，只有开关开着并且任务还挂着，才有「确认 / 取消」按钮。POST `/api/confirm` 必须是 JSON，Host 必须是本机，跨站请求会被拒绝；GET 不会批准。任务还不存在时写的确认，之后也不会执行。第一次启动不补历史。
 - **播报** `audi27 speak run` 按 brief 的顺序调用 macOS `say`（`[speak] voice`，默认 `Tingting`）。写出 `spoken`：念了什么、是否念完、是否被打断。没有 `say`（比如 Linux 上的测试）就记一条日志，进程不退出。`say` 报不出念到第几个字，`text` 是交给它的整句。`audi27 speak test "文字"` 只试这一句，不写事件。第一次启动不补历史。
 - **在不在说话** `[presence] enabled` 默认关。关掉时，播报仍看录音心跳 `data/status.json` 的 `speaking`（大约 0.4 秒写一次），为真就不开始，念到一半变成真就停 `say`，也不写 presence 文件。打开后，录音进程用分段器已有的能量判断，把 `data/presence.json` 原子替换更新：状态一变就写，另外最快每 `publish_s`（默认 0.1 秒）刷新一次，所以信号在 0.2 秒内可读。说话要连续 `onset_ms`（默认 60 毫秒）才算开口，安静要连续 `hangover_ms`（默认 400 毫秒）才算停，中间换气不会来回翻转。只有翻转才追加一条 `presence` 事件（`data.state` 为 `speaking` 或 `quiet`）。播报在 `speaking` 期间，以及变回安静后的 `grace_s`（默认 0.3 秒）内，都不开口。念到一半文件变成 `speaking`，大约 0.3 秒内停掉 `say`，`spoken` 的 `interrupted` 为真；队列用新的 brief id 把同一条再放出一次，已经有 `spoken` 的那条不会再读。文件缺失、读不了、超过 `stale_s` 没更新、或时间戳在未来（时钟跳了），都当成不知道，不卡住。没有单独的 presence 进程，`start.sh` 不会因为这个开关多拉起一个进程。达达这一轮还开着时并不额外算忙：turn 事件是轮次结束才写的，流上看不到「还开着」。
 
-`spoken` 的 `ref` 指回 brief，再往前是 reply、task、route、turn、utterance。仪表盘「路由」页下面多一块「回路」，列出 task / reply / brief / spoken。
+`spoken` 的 `ref` 指回 brief，再往前是 reply、task、route、turn、utterance。`confirm` 的 `ref` 指回挂起的 task。仪表盘「路由」页下面多一块「回路」，列出 task / reply / brief / spoken / confirm；挂起的任务旁边是确认和取消。
 
 ## 换转写后端
 
@@ -178,7 +180,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[screen]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[confirm]`、`[screen]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
 
 改完代码后重启，不需要碰那个终端：
 
@@ -193,11 +195,11 @@ echo "改了什么" > data/restart.request
 
 `[screen] enabled` 默认关。关掉时不采样、不写 `screen` 事件，turn 和 route 跟以前一样。打开后 `./start.sh` 会拉起 `audi27 screen run`。
 
-只记录最前面的应用名、bundle id 和最前窗口的标题。不截图、不做 OCR、不读窗口里的文字。macOS 上应用名来自 `lsappinfo`；窗口标题来自 `osascript`，需要给运行 audi27 的程序辅助功能权限，拒绝的话只记应用名，并且只警告一次。不是 macOS 就打一条日志，不写事件。
+只记录最前面的应用名、bundle id 和最前窗口的标题。不截图、不做 OCR、不读窗口里的文字。macOS 上一次 `osascript` 同时读这三样，保证标题属于同一个进程；脚本是固定的，不会把应用名或标题拼进去。调用有超时，卡住就杀掉整个进程组，已经打出来的半截输出丢掉。辅助功能被拒绝时改用 `lsappinfo` 只记应用名，并且只警告一次，之后不再调用 `osascript`。不是 macOS 就打一条日志，不写事件。
 
-应用或标题变了，并且稳住 `debounce_s`（默认 1 秒）才写一条，所以快速切换不会刷屏。`exclude_apps` 默认有 1Password、Bitwarden、钥匙串访问；命中时只留应用名，标题抹掉。银行类应用写在这个列表里。无痕窗口（标题里能看出 incognito、inprivate、无痕等）和 `redact_title_patterns` 会整段丢掉标题。标题最长 `max_title_chars`（默认 200）。
+应用或标题变了，并且稳住 `debounce_s`（默认 1 秒）才写一条，所以快速切换不会刷屏。抹掉标题发生在比较和写事件之前。`exclude_apps` 默认有 1Password（含 `com.agilebits.onepassword7`）、Bitwarden、钥匙串访问（含 `钥匙串访问` 和 `com.apple.keychainaccess`）。名字不区分大小写；带空格的名字会拿掉空格再对 bundle id，所以「Keychain Access」对得上 `com.apple.keychainaccess`。命中时只留应用名，标题抹掉。银行类应用不在默认列表里，要自己加。无痕窗口（标题里能看出 incognito、inprivate、无痕等）和 `redact_title_patterns` 会整段丢掉标题。标题最长 `max_title_chars`（默认 200）。
 
-轮次结束时，如果当时最近的一条 `screen` 不超过 `stale_s`（默认 3600 秒），就记在 turn 上，route 再抄过去。发给 Grok Bot 还要另开 `[grokbot] include_screen`（默认关）。
+采样进程活着时会改写 `data/screen.json`，里面只有 `started` 和 `updated` 两个时间，没有应用名，也没有标题。轮次结束时，如果这个心跳说明采样当时还在跑，就算上一条 `screen` 比 `stale_s`（默认 3600 秒）更老，也会记在 turn 上：没变化就不写事件，窗口还是那一个。心跳说明采样已经停了，或者这个进程是轮次之后才启动的，就不附带。没有心跳文件时，才用 `stale_s` 当最长时间。route 再抄过去，排除名单里的标题会再抹一次。发给 Grok Bot 还要另开 `[grokbot] include_screen`（默认关），发出去之前再抹一次。
 
 ## 对比页（仪表盘 → 模型对比）
 

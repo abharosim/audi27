@@ -1,5 +1,8 @@
 """Report queue. Pure fold over events: replies and failures in, briefs out.
 
+With `[confirm] enabled`, an `awaiting_confirmation` task is also a decision
+brief that reads the action back and asks 确认还是取消？ Off, that task is ignored.
+
 Priority, highest first: decision (the reply asks for a call), error (a failed
 task), done (a normal reply), info (a queue command such as "what's left", or
 a reply that says so). Several items that arrive together are ordered before
@@ -28,8 +31,10 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
+from .confirm import ASK, TARGET_LABEL
 from .events import append, make_event, read_new, replay, snapshot_offsets
 
 log = logging.getLogger("audi27.queue")
@@ -54,6 +59,8 @@ class Item:
     ts: str
     deferred: bool = False
     attempts: int = 0
+    kind: str = "report"
+    task_id: str | None = None
 
 
 @dataclass
@@ -83,6 +90,8 @@ class ReportQueue:
     followups: list[_Followup] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
     seq: int = 0
+    confirm: bool = False
+    clock: object | None = None
 
     def push_all(self, events) -> list[dict]:
         """Briefs newly decided by `events`, in the order they should be spoken.
@@ -126,21 +135,30 @@ class ReportQueue:
             text = data.get("text") if isinstance(data.get("text"), str) else ""
             self._add(ident, _reply_priority(data), text, ts)
             return
+        if ev.get("type") == "task" and data.get("status") == "awaiting_confirmation" and self.confirm:
+            request = data.get("text") if isinstance(data.get("text"), str) else ""
+            text = confirmation_line(data.get("target"), request, self.summary_chars)
+            self._add(ident, "decision", text, ts, kind="confirm", summary=text, task_id=ident)
+            return
         if ev.get("type") == "task" and data.get("status") == "failed":
             error = data.get("error") if isinstance(data.get("error"), str) else ""
             text = error or (data.get("text") if isinstance(data.get("text"), str) else "") or "失败"
             self._add(ident, "error", text, ts)
 
-    def _add(self, ident: str, priority: str, text: str, ts: str) -> None:
+    def _add(self, ident: str, priority: str, text: str, ts: str, *,
+             kind: str = "report", summary: str | None = None, task_id: str | None = None) -> None:
         self.seq += 1
         self.items.append(Item(
             id=ident,
             priority=priority if priority in _RANK else "info",
-            summary=summarize(text, limit=self.summary_chars, summarize_fn=self.summarize_fn),
+            summary=summary if summary is not None else summarize(
+                text, limit=self.summary_chars, summarize_fn=self.summarize_fn),
             text=text,
             text_ref=ident,
             seq=self.seq,
             ts=ts,
+            kind=kind,
+            task_id=task_id,
         ))
         self._sort()
 
@@ -297,9 +315,12 @@ class ReportQueue:
         self.inflight = item
         self.last = item
         brief_id = f"brief-{item.id}" if item.attempts == 1 else f"brief-{item.id}-{item.attempts}"
+        # A confirmation is read back when it is released, not when the task was written.
+        ts = self._clock_ts() if item.kind == "confirm" else item.ts
         brief = _brief(
             id=brief_id, ref=item.id, priority=item.priority, summary=item.summary,
-            text_ref=item.text_ref, kind="report", item_id=item.id, ts=item.ts,
+            text_ref=item.text_ref, kind=item.kind, item_id=item.id, ts=ts,
+            task_id=item.task_id,
         )
         self.holding = brief["id"]
         return [brief]
@@ -329,6 +350,12 @@ class ReportQueue:
         self.inflight_follow = follow
         return brief
 
+    def _clock_ts(self):
+        if self.clock is None:
+            return datetime.now().astimezone()
+        value = self.clock()
+        return value
+
     def _pending_text(self) -> str:
         rows = list(self.items)
         if self.inflight is not None and self.disposition != "drop":
@@ -352,14 +379,32 @@ def _reply_priority(data: dict) -> str:
 
 
 def _brief(*, id: str, ref: str, priority: str, summary: str, text_ref: str,
-           kind: str, item_id: str | None, ts: str) -> dict:
-    return make_event("brief", QUEUE_SOURCE, {
+           kind: str, item_id: str | None, ts, task_id: str | None = None) -> dict:
+    data = {
         "priority": priority,
         "summary": summary,
         "text_ref": text_ref,
         "kind": kind,
         "item_id": item_id,
-    }, ts=ts or None, ref=ref, id=id)
+    }
+    if task_id:
+        data["task_id"] = task_id
+    return make_event("brief", QUEUE_SOURCE, data, ts=ts or None, ref=ref, id=id)
+
+
+def confirmation_line(target, text: str, limit: int) -> str:
+    """One spoken line: who would do it, a short paraphrase, then the question."""
+    label = TARGET_LABEL.get(target, target if isinstance(target, str) and target else "它")
+    head = f"发给 {label}："
+    tail = f"。{ASK}"
+    sentence = first_sentence(" ".join((text or "这件事").split()), 10_000) or "这件事"
+    if limit and limit > 0:
+        room = limit - len(head) - len(tail)
+        if room < 1:
+            return ASK if limit >= len(ASK) else ASK[:limit]
+        if len(sentence) > room:
+            sentence = (sentence[:room - 1].rstrip() + "…") if room > 1 else "…"
+    return head + sentence + tail
 
 
 def first_sentence(text: str, limit: int) -> str:
@@ -402,7 +447,8 @@ def summarize(text: str, *, limit: int = 80, summarize_fn=None) -> str:
 
 def load_state(data_dir, cfg, *, summarize_fn=None) -> ReportQueue:
     """Rebuild the queue from the event log. Does not write."""
-    q = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn)
+    q = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn,
+                    confirm=cfg.confirm.enabled)
     q.push_all(replay(data_dir))
     return q
 
@@ -417,9 +463,10 @@ def write_briefs(data_dir, briefs) -> dict:
     return {"wrote": wrote, "skipped": skipped}
 
 
-def sync(data_dir, cfg, *, summarize_fn=None) -> tuple[ReportQueue, dict]:
+def sync(data_dir, cfg, *, summarize_fn=None, clock=None) -> tuple[ReportQueue, dict]:
     """Rebuild from the log and append briefs that are not stored yet."""
-    queue = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn)
+    queue = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn,
+                        confirm=cfg.confirm.enabled, clock=clock)
     briefs = queue.push_all(list(replay(data_dir)))
     return queue, write_briefs(data_dir, briefs)
 
@@ -492,7 +539,8 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
     it folds the whole log, which is the right view when you are inspecting.
     """
     stop = stop or threading.Event()
-    queue = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn)
+    queue = ReportQueue(summary_chars=cfg.queue.summary_chars, summarize_fn=summarize_fn,
+                        confirm=cfg.confirm.enabled)
     saved = _load_book(data_dir)
     if saved is None:
         epoch = snapshot_offsets(data_dir)

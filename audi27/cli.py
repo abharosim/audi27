@@ -126,7 +126,8 @@ def cmd_supervise(args, cfg) -> int:
     supervisor.main(args.config, cfg.store.data_dir, args.host, args.port,
                     turns=cfg.turns.enabled, route=cfg.route.enabled,
                     dispatch=cfg.dispatch.enabled, queue=cfg.queue.enabled,
-                    speak=cfg.speak.enabled, screen=cfg.screen.enabled)
+                    speak=cfg.speak.enabled, confirm=cfg.confirm.enabled,
+                    screen=cfg.screen.enabled)
     return 0
 
 
@@ -335,6 +336,23 @@ def cmd_grokbot(args, cfg) -> int:
     return 0
 
 
+def cmd_confirm(args, cfg) -> int:
+    from .confirm import serve
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_queue(args, cfg) -> int:
     from .queue import format_queue, load_state, serve
 
@@ -503,6 +521,12 @@ def main(argv=None) -> int:
     gin.add_argument("--data-dir")
     gin.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
     gp.set_defaults(fn=cmd_grokbot)
+    cp = sub.add_parser("confirm", help="turn a yes/no after a read-back into a confirm event")
+    csub = cp.add_subparsers(dest="confirm_cmd", required=True)
+    crun = csub.add_parser("run", help="follow the event stream and emit confirm events")
+    crun.add_argument("--data-dir")
+    crun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    cp.set_defaults(fn=cmd_confirm)
     qp = sub.add_parser("queue", help="turn replies into briefs and apply queue commands")
     qsub = qp.add_subparsers(dest="queue_cmd", required=True)
     qrun = qsub.add_parser("run", help="follow the event stream and emit brief events")

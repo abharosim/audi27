@@ -15,6 +15,7 @@ from audi27.cli import main
 from audi27.dispatch import dispatch_all, dispatch_one, serve
 from audi27.events import append, make_event, ref_chain, replay
 from audi27.grokbot import TIMEOUT_REASON, GrokbotAgent, poll_inbox, post_webhook, serve_inbox, tick
+from audi27.screen import prepare
 from audi27.queue import ReportQueue
 from audi27.route import decide, load_rules, route_event
 
@@ -293,6 +294,35 @@ def test_screen_stays_off_the_post_unless_include_screen(tmp_path, webhook, monk
     assert "hunter2" not in raw
     assert json.loads(raw)["context"]["screen"]["title"] is None
     assert json.loads(raw)["context"]["screen"]["title_redacted"] is True
+
+    # An excluded app's title is dropped again at the POST, even if a route
+    # stored it without the redaction flag.
+    secret = "vault-master-password"
+    leaked = route("route-vault")
+    leaked["data"]["screen"] = {
+        "app": "钥匙串访问",
+        "bundle_id": "com.apple.keychainaccess",
+        "title": secret,
+        "title_redacted": False,
+    }
+    dispatch_one(leaked, cfg, appending(data), data_dir=data)
+    raw = box.requests[4]["raw"].decode()
+    assert secret not in raw
+    posted = json.loads(raw)["context"]["screen"]
+    assert posted["title"] is None and posted["title_redacted"] is True
+    assert posted["app"] == "钥匙串访问"
+
+    prepared = prepare(
+        {"app": "密码", "bundle_id": "com.agilebits.onepassword7", "title": secret},
+        C.Config().screen,
+    )
+    assert secret not in json.dumps(prepared)
+    shaped = route("route-1p")
+    shaped["data"]["screen"] = prepared
+    dispatch_one(shaped, cfg, appending(data), data_dir=data)
+    raw = box.requests[5]["raw"].decode()
+    assert secret not in raw
+    assert json.loads(raw)["context"]["screen"]["title"] is None
 
 
 def test_duplicate_reply_file_emits_once(tmp_path):

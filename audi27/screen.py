@@ -4,58 +4,74 @@ Privacy boundary: a sample is the frontmost app name, its bundle id, and the
 front window's title. Nothing else. No screenshots, no OCR, no window contents,
 and no accessibility tree beyond that one title. Titles of excluded apps,
 private browser windows, and configured patterns are dropped before the event
-is built, so the dropped text is never written.
+is built, so the dropped text is never written and is not logged.
 
-Sampling is off unless `[screen] enabled` is true. On macOS the app name and
-bundle id come from `lsappinfo` (no Accessibility permission). The window title
-comes from `osascript` and needs Accessibility; if that is denied, events keep
-the app and leave the title empty, and the denial is logged once. Other
-platforms stay idle and write nothing.
+Sampling is off unless `[screen] enabled` is true. On macOS one `osascript`
+reads the front app, its bundle id, and that same process's window title. The
+script is a fixed string: the app name and the title are never interpolated.
+`lsappinfo` is only the fallback when that call is denied or the app has no
+window. A denial is logged once, and later polls do not call `osascript`.
+Other platforms stay idle and write nothing.
 
+Each command has a timeout. On timeout the process group is killed and any
+partial output is discarded, so a title that was already printed is not kept.
 Events are written only when the recorded snapshot changes, and only after it
 has held still for `debounce_s`, so a burst of alt-tab does not flood the log.
+
+`data/screen.json` is a liveness heartbeat: `started` and `updated` only, no
+app and no title. A turn attaches the latest change-only snapshot when that
+heartbeat shows the sampler was running at the turn. A stopped sampler does
+not: an old event is not the current window just because it is younger than
+`stale_s`.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from .events import emit, replay
 
 log = logging.getLogger("audi27.screen")
 
 SCREEN_SOURCE = "screen"
+HEARTBEAT_NAME = "screen.json"
 _APP_LIMIT = 200
-# osascript errors that mean Accessibility was not granted. The title is then
-# omitted; the app name from lsappinfo still stands. -1728 is "no such window",
-# which is an empty title, not a denial.
+# How far back a live sampler may look. Change-only events mean a window that
+# has not changed is still front, so the last event can be days old.
+_LIVE_LOOKBACK_S = 7 * 24 * 3600.0
+_HEARTBEAT_SKEW_S = 2.0
+_FUTURE_S = 60.0
+# osascript errors that mean Accessibility was not granted. Matched only
+# against a failed command, never against a window title that happened to
+# contain a number. -1728 is "no such window", an empty title, not a denial.
 _DENIED_MARKERS = (
     "not allowed assistive",
     "assistive access",
-    "not authorized",
-    "-25211",
-    "-1743",
-    "1002",
+    "not authorized to send apple events",
+    "(-25211)",
+    "(-1743)",
+    "(-1719)",
+    "(1002)",
 )
 # "Can't get window" is an app with no window, not a permission failure.
 _NO_WINDOW_MARKERS = ("-1728", "can't get", "cannot get")
 
-# Front window title only. Do not ask for UI elements, values, or the document.
-# No `try` around it: a permission error must reach us, or it looks like "no window".
-_TITLE_SCRIPT = """
-tell application "System Events"
-    return name of front window of first application process whose frontmost is true
-end tell
-"""
-
-# Used only when lsappinfo cannot name the front app.
-_APP_SCRIPT = """
+# One process, so the title cannot belong to a different app than the name.
+# Do not interpolate the app name or the title into this string, and do not
+# wrap the window read in `try`: a permission error must reach us, or it looks
+# like "no window". `try` is only around the bundle id, which some processes
+# do not have.
+_FRONT_SCRIPT = """
 tell application "System Events"
     set p to first application process whose frontmost is true
     set appName to name of p
@@ -63,7 +79,8 @@ tell application "System Events"
     try
         set bid to bundle identifier of p
     end try
-    return appName & linefeed & bid
+    set winName to name of front window of p
+    return appName & linefeed & bid & linefeed & winName
 end tell
 """
 
@@ -78,17 +95,65 @@ def enabled(cfg) -> bool:
     return screen is not None and bool(getattr(screen, "enabled", False))
 
 
-def _run_command(argv: list[str], timeout: float = 3.0) -> tuple[int, str, str]:
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the command and anything it started. Partial output is not read."""
+    if proc.poll() is not None:
+        return
+    pid = proc.pid
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        if pid and pid > 0:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        return 1, "", "timeout"
+        pass
+
+
+def _run_command(argv: list[str], timeout: float = 3.0) -> tuple[int, str, str]:
+    """Run `argv` without a shell. On timeout, kill the process group and return no output.
+
+    A title may already have been printed when the timer fires. That text is
+    discarded, and it is not included in the returned error.
+    """
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
     except OSError as e:
         return 1, "", str(e)
-    return proc.returncode, proc.stdout or "", proc.stderr or ""
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            return 1, "", "timeout"
+        code = proc.returncode if proc.returncode is not None else 1
+        return code, out or "", err or ""
+    finally:
+        if proc.poll() is None:
+            _kill_group(proc)
 
 
 def _denied(text: str) -> bool:
+    """True when `text` is an osascript failure caused by a missing Accessibility grant.
+
+    Callers pass stderr (and stdout only when the command failed). A window
+    title that contains "1002" or "not authorized" is not a denial.
+    """
     folded = text.casefold()
     return any(marker.casefold() in folded for marker in _DENIED_MARKERS)
 
@@ -109,6 +174,24 @@ def parse_lsappinfo(front_text: str, info_text: str) -> tuple[str, str] | None:
     if not name:
         return None
     return name, bundle
+
+
+def _split_front(text: str) -> tuple[str, str, str] | None:
+    """App, bundle id, and title from one osascript result. The title may contain newlines."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not text.strip():
+        return None
+    parts = text.split("\n", 2)
+    app = parts[0].strip()
+    if not app or app.casefold() == "missing value":
+        return None
+    bundle = parts[1].strip() if len(parts) > 1 else ""
+    if bundle.casefold() == "missing value":
+        bundle = ""
+    title = parts[2] if len(parts) > 2 else ""
+    if title.strip().casefold() == "missing value":
+        title = ""
+    return app, bundle, title
 
 
 def _asn(text: str) -> str:
@@ -151,19 +234,58 @@ class FrontSampler:
 
         `title` is None when the window title could not be read (Accessibility
         denied, or the title command failed). It is "" when the front app has
-        no window. The dict has no other keys.
+        no window. The dict has no other keys. App name, bundle id, and title
+        come from one osascript call so they belong to the same process.
         """
-        named = self._app()
-        if named is None:
-            return None
-        app, bundle = named
-        return {"app": app, "bundle_id": bundle, "title": self._title()}
-
-    def _app(self) -> tuple[str, str] | None:
+        if not self._logged_denied:
+            kind = self._from_osascript()
+            if kind[0] == "ok":
+                return {"app": kind[1], "bundle_id": kind[2], "title": kind[3]}
+            if kind[0] == "denied":
+                self._note_denied()
+            elif kind[0] == "empty":
+                named = self._app_from_lsappinfo()
+                if named is None:
+                    return None
+                return {"app": named[0], "bundle_id": named[1], "title": ""}
         named = self._app_from_lsappinfo()
-        if named is not None:
-            return named
-        return self._app_from_osascript()
+        if named is None:
+            if not self._logged_app and not self._logged_denied:
+                self._logged_app = True
+                log.warning("frontmost app is unavailable; no screen events until it can be named")
+            return None
+        return {"app": named[0], "bundle_id": named[1], "title": None}
+
+    def _note_denied(self) -> None:
+        if self._logged_denied:
+            return
+        self._logged_denied = True
+        log.warning(
+            "window title needs Accessibility permission for the app running audi27 "
+            "(System Settings → Privacy & Security → Accessibility); recording the app name only"
+        )
+
+    def _from_osascript(self) -> tuple:
+        """`("ok", app, bundle, title)`, `("denied",)`, `("empty",)`, or `("fail",)`.
+
+        A zero exit is a title, even when the text contains "1002" or
+        "not authorized". Denial is decided from a failed command only.
+        """
+        code, out, err = self._run(["osascript", "-e", _FRONT_SCRIPT])
+        if code == 0:
+            parsed = _split_front(out)
+            if parsed is None:
+                return ("fail",)
+            return ("ok", parsed[0], parsed[1], parsed[2])
+        blob = f"{err}\n{out}"
+        if _denied(blob):
+            return ("denied",)
+        if any(marker in blob.casefold() for marker in _NO_WINDOW_MARKERS):
+            return ("empty",)
+        if not self._logged_title:
+            self._logged_title = True
+            log.warning("window title is unavailable; recording the app name only")
+        return ("fail",)
 
     def _app_from_lsappinfo(self) -> tuple[str, str] | None:
         code, out, _err = self._run(["lsappinfo", "front"])
@@ -175,45 +297,6 @@ class FrontSampler:
             return None
         return parse_lsappinfo(out, info)
 
-    def _app_from_osascript(self) -> tuple[str, str] | None:
-        code, out, err = self._run(["osascript", "-e", _APP_SCRIPT])
-        if code != 0 or _denied(err) or _denied(out):
-            if not self._logged_app:
-                self._logged_app = True
-                log.warning("frontmost app is unavailable; no screen events until it can be named")
-            return None
-        lines = [line.strip() for line in out.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-        lines = [line for line in lines if line]
-        if not lines:
-            return None
-        bundle = lines[1] if len(lines) > 1 else ""
-        return lines[0], bundle
-
-    def _title(self) -> str | None:
-        if self._logged_denied:
-            return None
-        code, out, err = self._run(["osascript", "-e", _TITLE_SCRIPT])
-        blob = f"{err}\n{out}"
-        if _denied(blob):
-            if not self._logged_denied:
-                self._logged_denied = True
-                log.warning(
-                    "window title needs Accessibility permission for the app running audi27 "
-                    "(System Settings → Privacy & Security → Accessibility); recording the app name only"
-                )
-            return None
-        if code != 0:
-            if any(marker in blob.casefold() for marker in _NO_WINDOW_MARKERS):
-                return ""
-            if not self._logged_title:
-                self._logged_title = True
-                log.warning("window title is unavailable; recording the app name only")
-            return None
-        text = out.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if text.casefold() == "missing value":
-            return ""
-        return text
-
 
 def make_sampler():
     """The macOS sampler, or None on any other platform."""
@@ -222,14 +305,38 @@ def make_sampler():
     return FrontSampler()
 
 
+def _compact(text: str) -> str:
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
+def _alias(compact: str) -> str:
+    """1Password's bundle id says onepassword, not 1password."""
+    return compact.replace("1password", "onepassword")
+
+
 def _excluded(app: str, bundle: str, names) -> bool:
-    hay_app = app.casefold()
-    hay_bundle = bundle.casefold()
+    """Case-insensitive match on the app name or the bundle id.
+
+    A needle with spaces also matches those letters run together, so
+    "Keychain Access" matches `com.apple.keychainaccess` and a localized
+    display name still excludes the app. Short needles stay substring matches
+    on the raw text only, so "app" does not exclude every Apple bundle.
+    """
+    folded_app = (app or "").casefold()
+    folded_bundle = (bundle or "").casefold()
+    compact_app = _alias(_compact(app or ""))
+    compact_bundle = _alias(_compact(bundle or ""))
     for name in names or []:
         if not isinstance(name, str):
             continue
-        needle = name.strip().casefold()
-        if needle and (needle in hay_app or needle in hay_bundle):
+        raw = name.strip()
+        if not raw:
+            continue
+        folded = raw.casefold()
+        if folded in folded_app or folded in folded_bundle:
+            return True
+        compact = _alias(_compact(raw))
+        if len(compact) >= 6 and (compact in compact_app or compact in compact_bundle):
             return True
     return False
 
@@ -315,15 +422,22 @@ def prepare(raw: dict, cfg) -> dict | None:
     return data
 
 
+_DROP_REASONS = frozenset({"excluded_app", "private", "pattern"})
+
+
 def public_context(data) -> dict | None:
-    """App, bundle id, and title only. A redacted title is forced to None."""
+    """App, bundle id, and title only. A redacted title is forced to None.
+
+    `title_reason` of excluded_app, private, or pattern drops the title even
+    when `title_redacted` was left false.
+    """
     if not isinstance(data, dict):
         return None
     app = data.get("app")
     if not isinstance(app, str) or not _one_line(app):
         return None
     bundle = data.get("bundle_id") if isinstance(data.get("bundle_id"), str) else ""
-    redacted = bool(data.get("title_redacted"))
+    redacted = bool(data.get("title_redacted")) or data.get("title_reason") in _DROP_REASONS
     title = data.get("title")
     if redacted or not isinstance(title, str):
         title = None
@@ -382,15 +496,131 @@ def context_at(data_dir, when, stale_s: float) -> dict | None:
     return chosen
 
 
+def liveness_window(cfg) -> float:
+    """How long a sampler may go without a heartbeat and still count as running.
+
+    A hung `osascript` blocks one poll, so this is several poll intervals and
+    at least 15 s. It is not `stale_s`.
+    """
+    screen = getattr(cfg, "screen", None)
+    poll = float(getattr(screen, "poll_s", 2.0) or 2.0)
+    debounce = float(getattr(screen, "debounce_s", 0.0) or 0.0)
+    return max(15.0, poll * 3 + debounce + 5.0)
+
+
+def _number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def write_heartbeat(data_dir, started: float, updated: float) -> None:
+    """Atomically replace `screen.json` with two timestamps. No app and no title."""
+    root = Path(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {"started": float(started), "updated": float(updated)}
+    tmp = root / (HEARTBEAT_NAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, root / HEARTBEAT_NAME)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_heartbeat(data_dir) -> dict | None:
+    """The heartbeat file, or None when it is missing or not a JSON object."""
+    path = Path(data_dir) / HEARTBEAT_NAME
+    for _ in range(2):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _known_heartbeat(data) -> bool:
+    return isinstance(data, dict) and _number(data.get("started")) is not None and _number(data.get("updated")) is not None
+
+
+def heartbeat_covers(data, when: datetime, liveness_s: float, now: float | None = None) -> bool:
+    """True when this sampler process was running at `when` and had checked in recently.
+
+    `started` is when the process began. `updated` is the last successful sample.
+    A process that started after the turn cannot describe it. A process whose
+    last sample is older than `liveness_s` before the turn had already stopped.
+    """
+    if not _known_heartbeat(data):
+        return False
+    started = _number(data.get("started"))
+    updated = _number(data.get("updated"))
+    if started is None or updated is None:
+        return False
+    now = time.time() if now is None else now
+    when_e = when.timestamp()
+    # Ahead of both the machine clock and the turn: a clock jump, not a replay
+    # of an older log on a machine whose clock is behind the timestamps.
+    horizon = max(now, when_e) + _FUTURE_S
+    if updated > horizon or started > horizon:
+        return False
+    if started > when_e + _HEARTBEAT_SKEW_S:
+        return False
+    if updated < when_e - liveness_s:
+        return False
+    return True
+
+
+def _strip_excluded(view, cfg):
+    """Drop a title the current exclude list rejects, including one stored earlier."""
+    if not view:
+        return None
+    names = getattr(getattr(cfg, "screen", None), "exclude_apps", ())
+    if _excluded(view.get("app") or "", view.get("bundle_id") or "", names):
+        return {**view, "title": None, "title_redacted": True}
+    return view
+
+
 def context_for(data_dir, cfg, when) -> dict | None:
-    """`context_at` when screen is enabled, else None. A read error attaches nothing."""
+    """Screen snapshot for a turn, or None when screen is off or the sampler was not running.
+
+    A heartbeat that covers `when` means the change-only log is still current,
+    so the latest event may be older than `stale_s`. A heartbeat that does not
+    cover `when` means the sampler had stopped (or this process started later):
+    nothing is attached. With no heartbeat file, `stale_s` is the age limit.
+    """
     if not enabled(cfg):
         return None
     try:
-        return context_at(data_dir, when, cfg.screen.stale_s)
+        return _context_for(data_dir, cfg, when)
     except Exception:
         log.exception("screen context was not read")
         return None
+
+
+def _context_for(data_dir, cfg, when) -> dict | None:
+    end = _parse_when(when)
+    if end is None:
+        return None
+    try:
+        stale = float(cfg.screen.stale_s)
+    except (TypeError, ValueError):
+        return None
+    if stale < 0:
+        return None
+    hb = load_heartbeat(data_dir)
+    if _known_heartbeat(hb):
+        if heartbeat_covers(hb, end, liveness_window(cfg)):
+            view = context_at(data_dir, end, max(stale, _LIVE_LOOKBACK_S))
+        else:
+            view = None
+    else:
+        view = context_at(data_dir, end, stale)
+    return _strip_excluded(view, cfg)
 
 
 def snapshot_key(payload: dict) -> tuple:
@@ -508,6 +738,7 @@ def run(data_dir, cfg, *, sampler=None, stop: threading.Event | None = None,
         interval = cfg.screen.poll_s
     debouncer = Debouncer(cfg.screen.debounce_s)
     _seed(debouncer, data_dir)
+    started = time.time()
     next_sample = clock()
     while not stop.is_set():
         now = clock()
@@ -518,8 +749,13 @@ def run(data_dir, cfg, *, sampler=None, stop: threading.Event | None = None,
                 log.exception("screen sample failed")
                 raw = None
             next_sample = now + interval
-            if raw:
-                debouncer.note(prepare(raw, cfg.screen), now)
+            prepared = prepare(raw, cfg.screen) if raw else None
+            if prepared:
+                debouncer.note(prepared, now)
+                try:
+                    write_heartbeat(data_dir, started, time.time())
+                except Exception:
+                    log.exception("screen heartbeat was not written")
         emitted = debouncer.take(clock())
         if emitted is not None:
             try:

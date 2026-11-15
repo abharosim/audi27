@@ -114,6 +114,16 @@ class GrokbotCfg:
 
 
 @dataclass
+class ConfirmCfg:
+    # Voice/dashboard confirmation of needs_confirmation tasks. Default off:
+    # a task stays awaiting_confirmation and the adapter is never called.
+    # `audi27 supervise` starts `confirm run` only when this is true.
+    enabled: bool = False
+    ttl_s: float = 600.0       # pending confirmation older than this becomes expired
+    window_s: float = 20.0     # bare (no wake word) answers are accepted this long after the read-back
+
+
+@dataclass
 class QueueCfg:
     # `audi27 supervise` starts `queue run` only when this is true. `queue run` ignores it.
     enabled: bool = False
@@ -146,11 +156,26 @@ class ScreenCfg:
     enabled: bool = False
     poll_s: float = 2.0          # how often the front app is read
     debounce_s: float = 1.0      # a snapshot must hold this long before it is written
-    stale_s: float = 3600.0      # older than this at turn time, it is not attached
+    # With no sampler heartbeat, an event older than this is not attached.
+    # A live sampler (data/screen.json) may attach an older change-only snapshot;
+    # a stopped sampler attaches nothing, even inside this window.
+    stale_s: float = 3600.0
     max_title_chars: int = 200
-    # Substring of the app name or bundle id. A match keeps the app name and drops the title.
-    # Banking apps are added here; they are not in the default list.
-    exclude_apps: list = field(default_factory=lambda: ["1Password", "Bitwarden", "Keychain Access"])
+    # App name or bundle id. A match keeps the app name and drops the title.
+    # "Keychain Access" also matches com.apple.keychainaccess, and "1Password"
+    # also matches com.agilebits.onepassword7. Banking apps are not listed;
+    # add them here.
+    exclude_apps: list = field(default_factory=lambda: [
+        "1Password",
+        "com.1password.1password",
+        "com.agilebits.onepassword7",
+        "com.agilebits.onepassword",
+        "Bitwarden",
+        "com.bitwarden.desktop",
+        "Keychain Access",
+        "钥匙串访问",
+        "com.apple.keychainaccess",
+    ])
     # A title matching any of these (case-insensitive) is dropped whole.
     redact_title_patterns: list = field(default_factory=list)
     # Substrings that mark a private/incognito browser window. The title is then dropped.
@@ -183,6 +208,7 @@ class Config:
     dispatch: DispatchCfg = field(default_factory=DispatchCfg)
     fake: FakeCfg = field(default_factory=FakeCfg)
     grokbot: GrokbotCfg = field(default_factory=GrokbotCfg)
+    confirm: ConfirmCfg = field(default_factory=ConfirmCfg)
     queue: QueueCfg = field(default_factory=QueueCfg)
     speak: SpeakCfg = field(default_factory=SpeakCfg)
     presence: PresenceCfg = field(default_factory=PresenceCfg)
@@ -257,6 +283,7 @@ def _check_all(cfg: Config) -> None:
     _check_dispatch(cfg)
     _check_fake(cfg)
     _check_grokbot(cfg)
+    _check_confirm(cfg)
     _check_queue(cfg)
     _check_speak(cfg)
     _check_presence(cfg)
@@ -343,6 +370,18 @@ def _check_grokbot(cfg: Config) -> None:
         raise ConfigError("grokbot.parse_retries must be >= 1")
     if not isinstance(g.include_screen, bool):
         raise ConfigError("grokbot.include_screen must be true or false")
+
+
+def _check_confirm(cfg: Config) -> None:
+    c = cfg.confirm
+    if not isinstance(c.enabled, bool):
+        raise ConfigError("confirm.enabled must be true or false")
+    c.ttl_s = _as_float(c.ttl_s, "confirm.ttl_s")
+    c.window_s = _as_float(c.window_s, "confirm.window_s")
+    if c.ttl_s <= 0:
+        raise ConfigError("confirm.ttl_s must be > 0")
+    if c.window_s < 0:
+        raise ConfigError("confirm.window_s must be >= 0")
 
 
 def _check_queue(cfg: Config) -> None:

@@ -706,14 +706,11 @@ def route_event(turn: dict, decision: Decision, *, screen: dict | None = None) -
     """
     data = decision.data()
     if screen:
-        title = screen.get("title") if isinstance(screen.get("title"), str) else None
-        redacted = bool(screen.get("title_redacted"))
-        data["screen"] = {
-            "app": screen.get("app"),
-            "bundle_id": screen.get("bundle_id") or "",
-            "title": None if redacted else title,
-            "title_redacted": redacted,
-        }
+        from .screen import public_context
+
+        view = public_context(screen)
+        if view:
+            data["screen"] = view
     return make_event("route", ROUTE_SOURCE, data, ts=turn["ts"],
                       ref=turn["id"], id=route_id(turn["id"]))
 
@@ -722,9 +719,11 @@ def _screen_for_route(data_dir, cfg, turn: dict) -> dict | None:
     """Screen context for this turn when `[screen] enabled`, else None.
 
     A snapshot already stored on the turn wins. Otherwise the latest screen
-    event at the turn's timestamp, inside the staleness window, is used.
+    event at the turn's timestamp is used, when the sampler's heartbeat says
+    that snapshot was still current. An excluded app's title is dropped again
+    here, including one that was stored before the app was excluded.
     """
-    from .screen import context_for, enabled, public_context
+    from .screen import _strip_excluded, context_for, enabled, public_context
 
     if not enabled(cfg):
         return None
@@ -733,7 +732,7 @@ def _screen_for_route(data_dir, cfg, turn: dict) -> dict | None:
     if isinstance(attached, dict):
         view = public_context(attached)
         if view is not None:
-            return view
+            return _strip_excluded(view, cfg)
     return context_for(data_dir, cfg, turn.get("ts"))
 
 

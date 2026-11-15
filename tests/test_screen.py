@@ -1,6 +1,7 @@
 """Screen context: front app and window title, and nothing else."""
 import json
 import logging
+import subprocess
 import sys
 import threading
 import time
@@ -14,13 +15,15 @@ from audi27.cli import main
 from audi27.events import emit, emit_utterance, make_event, replay
 from audi27.route import replay_routes
 from audi27.screen import (
-    _APP_SCRIPT,
-    _TITLE_SCRIPT,
+    _FRONT_SCRIPT,
     Debouncer,
     FrontSampler,
+    _run_command,
     context_at,
+    context_for,
     make_sampler,
     prepare,
+    public_context,
     run,
 )
 from audi27.supervisor import child_specs
@@ -85,13 +88,95 @@ def _utt(data, text, start, end, ident="u1"):
     })
 
 
+def _heartbeat(data, *, started: float, updated: float) -> None:
+    root = Path(data)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "screen.json").write_text(
+        json.dumps({"started": started, "updated": updated}),
+        encoding="utf-8",
+    )
+
+
 def test_sampler_scripts_ask_only_for_the_front_window_title():
-    blob = (_TITLE_SCRIPT + "\n" + _APP_SCRIPT).lower()
+    blob = _FRONT_SCRIPT.lower()
     for banned in ("screenshot", "screencapture", "entire contents", "ui element", "value of", "ocr"):
         assert banned not in blob
-    assert "name of front window" in _TITLE_SCRIPT
-    assert "on error" not in _TITLE_SCRIPT
-    assert "bundle identifier" in _APP_SCRIPT
+    assert "name of front window" in _FRONT_SCRIPT
+    assert "bundle identifier" in _FRONT_SCRIPT
+    assert "on error" not in _FRONT_SCRIPT
+    assert "{" not in _FRONT_SCRIPT  # the script is not built from a value
+
+
+def test_window_title_is_not_an_accessibility_denial():
+    """A title that merely contains an error code must be kept, and sampling continues."""
+    calls = []
+
+    def run_cmd(argv):
+        assert isinstance(argv, list)
+        calls.append(argv[0])
+        if argv[0] == "lsappinfo":
+            return 1, "", "unused once osascript can name the front app"
+        assert argv[:2] == ["osascript", "-e"]
+        assert "Issue 1002" not in argv[-1]
+        return 0, "Notes\ncom.apple.Notes\nIssue 1002 — not authorized\n", ""
+
+    sampler = FrontSampler(run=run_cmd)
+    first = sampler.sample()
+    second = sampler.sample()
+    assert first == {
+        "app": "Notes",
+        "bundle_id": "com.apple.Notes",
+        "title": "Issue 1002 — not authorized",
+    }
+    assert second["title"] == "Issue 1002 — not authorized"
+    assert calls == ["osascript", "osascript"]
+
+
+def test_command_timeout_kills_the_group_and_drops_partial_output():
+    try:
+        code, out, err = _run_command(
+            ["bash", "-c", "echo SECRET-TITLE; sleep 60 & wait"],
+            timeout=0.3,
+        )
+        assert code != 0
+        assert out == "" and "SECRET-TITLE" not in err
+        assert err == "timeout"
+        time.sleep(0.2)
+        leftover = subprocess.run(["pgrep", "-af", "sleep 60"], capture_output=True, text=True)
+        lines = [line for line in leftover.stdout.splitlines() if "pgrep" not in line]
+        assert lines == []
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 60"], check=False)
+
+
+def test_exclude_matches_localized_name_and_bundle_id():
+    cfg = _cfg().screen
+    secret = "account-password"
+    for app, bundle in (
+        ("钥匙串访问", "com.apple.keychainaccess"),
+        ("钥匙串访问", "COM.APPLE.KEYCHAINACCESS"),
+        ("密码", "com.agilebits.onepassword7"),
+        ("1Password", "com.agilebits.onepassword"),
+    ):
+        got = prepare(_sample(app, secret, bundle), cfg)
+        assert got["title"] is None and got["title_redacted"] is True, (app, bundle)
+        assert got["title_reason"] == "excluded_app"
+        assert secret not in json.dumps(got)
+    visible = prepare(_sample("Notes", "shopping list", "com.apple.Notes"), cfg)
+    assert visible["title"] == "shopping list" and visible["title_redacted"] is False
+
+
+def test_title_reason_forces_the_title_out():
+    secret = "SECRET"
+    view = public_context({
+        "app": "1Password",
+        "bundle_id": "com.1password.1password",
+        "title": secret,
+        "title_redacted": False,
+        "title_reason": "excluded_app",
+    })
+    assert view["title"] is None and view["title_redacted"] is True
+    assert secret not in json.dumps(view)
 
 
 def test_prepare_redacts_excludes_and_truncates():
@@ -218,6 +303,7 @@ def test_non_mac_sampler_is_a_noop(tmp_path, caplog):
         run(data, cfg, sampler=None, stop=stop, wait=wait)
     assert "macOS" in caplog.text
     assert list(replay(data, types="screen")) == []
+    assert not (data / "screen.json").exists()
 
 
 def test_permission_denial_records_the_app_and_logs_once(caplog):
@@ -257,16 +343,99 @@ def test_a_missing_window_is_an_empty_title_not_a_denial():
 
 
 def test_osascript_names_the_app_when_lsappinfo_is_missing():
+    calls = []
+
     def run_cmd(argv):
+        calls.append(argv[0])
         if argv[0] == "lsappinfo":
             return 1, "", "not found"
-        script = argv[-1]
-        if "front window" in script:
-            return 0, "readme.md\n", ""
-        return 0, "Terminal\ncom.apple.Terminal\n", ""
+        return 0, "Terminal\ncom.apple.Terminal\nreadme.md\n", ""
 
     sample = FrontSampler(run=run_cmd).sample()
     assert sample == {"app": "Terminal", "bundle_id": "com.apple.Terminal", "title": "readme.md"}
+    assert calls == ["osascript"]
+
+
+def test_dead_sampler_is_not_the_current_window(tmp_path):
+    data = tmp_path / "data"
+    secret = "mail-subject-secret"
+    _screen(data, "Mail", secret, at=0)
+    when = 100
+    moment = BASE + timedelta(seconds=when)
+    _heartbeat(
+        data,
+        started=(BASE - timedelta(hours=2)).timestamp(),
+        updated=(moment - timedelta(minutes=30)).timestamp(),
+    )
+    got = context_for(data, _cfg(stale_s=3600), _iso(when))
+    assert got is None
+
+
+def test_live_sampler_keeps_a_window_older_than_stale_s(tmp_path):
+    data = tmp_path / "data"
+    _screen(data, "Cursor", "main.py", at=0)
+    when = 5000  # older than the default 3600s window
+    moment = BASE + timedelta(seconds=when)
+    _heartbeat(
+        data,
+        started=(BASE - timedelta(hours=1)).timestamp(),
+        updated=moment.timestamp(),
+    )
+    got = context_for(data, _cfg(stale_s=3600), _iso(when))
+    assert got["app"] == "Cursor" and got["title"] == "main.py"
+
+
+def test_sampler_started_after_the_turn_does_not_attach_that_past(tmp_path):
+    data = tmp_path / "data"
+    _screen(data, "Mail", "old-subject", at=0)
+    when = 30
+    moment = BASE + timedelta(seconds=when)
+    _heartbeat(
+        data,
+        started=(moment + timedelta(hours=1)).timestamp(),
+        updated=(moment + timedelta(hours=1)).timestamp(),
+    )
+    assert context_for(data, _cfg(stale_s=3600), _iso(when)) is None
+
+
+def test_no_heartbeat_still_uses_stale_s(tmp_path):
+    data = tmp_path / "data"
+    _screen(data, "Cursor", "main.py", at=0)
+    got = context_for(data, _cfg(stale_s=3600), _iso(100))
+    assert got["title"] == "main.py"
+    assert context_for(data, _cfg(stale_s=30), _iso(100)) is None
+
+
+def test_excluded_title_already_in_the_log_is_not_attached(tmp_path):
+    data = tmp_path / "data"
+    secret = "already-stored-secret"
+    _screen(data, "钥匙串访问", secret, at=10, bundle="com.apple.keychainaccess")
+    got = context_for(data, _cfg(stale_s=30), _iso(20))
+    assert got["app"] == "钥匙串访问"
+    assert got["title"] is None and got["title_redacted"] is True
+    assert secret not in json.dumps(got)
+
+
+def test_flag_off_ignores_a_fresh_heartbeat(tmp_path):
+    data = tmp_path / "data"
+    _screen(data, "Cursor", "secret-title", at=0)
+    moment = BASE + timedelta(seconds=10)
+    _heartbeat(data, started=(BASE - timedelta(hours=1)).timestamp(), updated=moment.timestamp())
+    assert context_for(data, C.Config(), _iso(10)) is None
+    assert "secret-title" not in json.dumps(context_for(data, C.Config(), _iso(10)))
+
+
+def test_heartbeat_file_does_not_store_the_title(tmp_path):
+    data = tmp_path / "data"
+    secret = "SECRET-WINDOW-TITLE"
+    _drive(data, [_sample("Notes", secret, "com.apple.Notes")], limit=6)
+    path = data / "screen.json"
+    assert path.is_file()
+    blob = path.read_text(encoding="utf-8")
+    assert secret not in blob
+    assert "Notes" not in blob
+    body = json.loads(blob)
+    assert set(body) == {"started", "updated"}
 
 
 def test_context_at_uses_the_latest_snapshot_inside_the_window(tmp_path):
@@ -373,7 +542,10 @@ def test_config_defaults_and_validation(tmp_path):
     assert cfg.screen.enabled is False
     assert cfg.screen.poll_s == 2.0 and cfg.screen.debounce_s == 1.0
     assert cfg.screen.stale_s == 3600 and cfg.screen.max_title_chars == 200
-    assert cfg.screen.exclude_apps == ["1Password", "Bitwarden", "Keychain Access"]
+    assert cfg.screen.exclude_apps[0] == "1Password"
+    assert "com.apple.keychainaccess" in cfg.screen.exclude_apps
+    assert "com.agilebits.onepassword7" in cfg.screen.exclude_apps
+    assert "钥匙串访问" in cfg.screen.exclude_apps
     assert "无痕" in cfg.screen.private_title_markers
     assert cfg.grokbot.include_screen is False
     example = C.load(Path(__file__).resolve().parents[1] / "config.example.toml")
@@ -402,9 +574,13 @@ def test_config_defaults_and_validation(tmp_path):
 
 def test_supervisor_starts_screen_only_when_asked():
     off = child_specs(None, "127.0.0.1", 8727)
-    assert "screen" not in off
+    assert "screen" not in off and "confirm" not in off
     on = child_specs("/tmp/audi27.toml", "127.0.0.1", 8727, screen=True)
     assert on["screen"][-2:] == ["screen", "run"]
+    assert "confirm" not in on
+    both = child_specs(None, "127.0.0.1", 8727, screen=True, confirm=True)
+    assert both["screen"][-2:] == ["screen", "run"]
+    assert both["confirm"][-2:] == ["confirm", "run"]
     assert "screen" not in child_specs(None, "127.0.0.1", 8727, turns=True, speak=True)
 
 
