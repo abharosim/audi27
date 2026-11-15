@@ -123,7 +123,7 @@ def cmd_supervise(args, cfg) -> int:
     from . import supervisor
 
     _setup_logging(Path(cfg.store.data_dir), args.verbose)
-    supervisor.main(args.config, cfg.store.data_dir, args.host, args.port)
+    supervisor.main(args.config, cfg.store.data_dir, args.host, args.port, turns=cfg.turns.enabled)
     return 0
 
 
@@ -145,6 +145,8 @@ def _print_event(ev: dict, as_json: bool) -> None:
     data = ev.get("data") or {}
     if ev.get("type") == "utterance":
         summary = " ".join(str(data.get("text", "")).split())
+    elif ev.get("type") == "turn":
+        summary = f"[{data.get('reason', '')}] " + " ".join(str(data.get("text", "")).split())
     else:
         summary = json.dumps(data, ensure_ascii=False)
         if len(summary) > 160:
@@ -184,6 +186,43 @@ def cmd_events(args, cfg) -> int:
         return 2
     except KeyboardInterrupt:
         return 0
+    return 0
+
+
+def cmd_turns(args, cfg) -> int:
+    from .turns import assemble_replay, format_turn, serve, turn_event, write_turn_file, write_turns
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    if args.turns_cmd == "run":
+        _setup_logging(Path(data_dir), args.verbose)
+
+        def _term(*_):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, _term)
+        try:
+            serve(data_dir, cfg, poll_s=args.poll)
+        except KeyboardInterrupt:
+            return 0
+        return 0
+    try:
+        since = parse_when(args.since) if getattr(args, "since", None) else None
+        until = parse_when(args.until, end_of_day=True) if getattr(args, "until", None) else None
+    except ValueError as e:
+        print(f"bad time: {e}", file=sys.stderr)
+        return 2
+    turns, stats = assemble_replay(data_dir, cfg, since=since, until=until)
+    if getattr(args, "output", None):
+        write_turn_file(args.output, turns)
+    if getattr(args, "write", False):
+        result = write_turns(data_dir, turns)
+        print(f"wrote {result['wrote']}, already present {result['skipped']}", file=sys.stderr)
+    for turn in turns:
+        if args.json:
+            print(json.dumps(turn_event(turn), ensure_ascii=False), flush=True)
+        else:
+            print(format_turn(turn), flush=True)
+    print(f"turns found: {stats['turns']}, utterances merged: {stats['utterances']}", file=sys.stderr)
     return 0
 
 
@@ -252,6 +291,19 @@ def main(argv=None) -> int:
     ec.add_argument("--data-dir")
     ec.add_argument("--json", action="store_true")
     evp.set_defaults(fn=cmd_events)
+    tp = sub.add_parser("turns", help="merge trigger-word utterances into one turn")
+    tsub = tp.add_subparsers(dest="turns_cmd", required=True)
+    trun = tsub.add_parser("run", help="follow the event stream and emit turn events")
+    trun.add_argument("--data-dir")
+    trun.add_argument("--poll", type=float, default=0.2, help="seconds between idle checks")
+    trep = tsub.add_parser("replay", help="assemble turns from history; prints them, does not write the live stream")
+    trep.add_argument("--data-dir")
+    trep.add_argument("--since", help="YYYY-MM-DD | ISO datetime | today | yesterday | 30m | 2h | 3d")
+    trep.add_argument("--until", help="same formats; a bare date includes that whole day")
+    trep.add_argument("--json", action="store_true", help="one JSON turn event per line")
+    trep.add_argument("--output", help="write turn events as JSONL to this file (replaced each run)")
+    trep.add_argument("--write", action="store_true", help="append turn events to the live event stream")
+    tp.set_defaults(fn=cmd_turns)
     e = sub.add_parser("eval", help="replay stored audio through other backends and compare")
     e.add_argument("--data-dir")
     esub = e.add_subparsers(dest="eval_cmd", required=True)

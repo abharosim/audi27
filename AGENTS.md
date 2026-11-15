@@ -53,6 +53,21 @@ uv run audi27 events chain <id>          # origin first, then each event that fo
 
 `--since` / `--until` use the same formats as `search`. From Python, `audi27.events.replay` reads a range and `audi27.events.follow` polls for new lines (default every 0.1 s). `audi27.events.ref_chain` walks `ref` back to the origin. Several processes can append. A torn last line is ignored until it is a complete event.
 
+## Turns
+
+The segmenter cuts on 0.8 s of silence, so one command arrives as several utterances. `audi27 turns` merges the ones that **start** with the trigger into a single `turn` event (`ref` = first utterance id). Anything else produces no event.
+
+Default triggers, config key `turns.triggers`: 达达, 哒哒, 大大, DaDa, dada, Dada. Latin forms are case-insensitive, including fullwidth letters, and must end on a word boundary (`dadapple` and `dada's`, straight or curly apostrophe, do not match). 大大 only counts at the start, and not as the head of an AABB word such as 大大小小 or 大大方方. Do not add 大大 to the context.md glossary, which rewrites every occurrence.
+
+`rejected` utterances are ignored and do not extend the gap. `suspect` utterances are kept (a low-confidence trigger is still a command) and the turn's `has_suspect` is true.
+
+```bash
+uv run audi27 turns replay --since today          # print only; --json, --output FILE, or --write
+uv run audi27 turns run                           # follow the stream and emit turns
+```
+
+Utterances are merged by audio time, not file order: a retried segment or a backfill can be appended after a later one. Close reasons: `gap` (audio gap greater than `gap_s`, default 2 s), `max` (audio span reached `max_duration_s`, default 120 s), `new_trigger`, `timeout` (live idle `wall_close_s`, default 8 s, measured from when the last utterance was seen; the batch is ordered before the close), `eof` (replay ended, or the live process is stopping). The first `turns run` starts at the end of the stream. A restart resumes from `data/turns.cursor.json` and does not write a turn id again. Replay is deterministic and does not append to the live stream unless `--write`. `[turns] enabled = true` makes `audi27 supervise` start `turns run` as well; if that process crashes, only it is restarted.
+
 ## Replays
 
 `data/evals/<label>.jsonl` holds re-transcriptions of the same audio by other models (same `id` as the live record).

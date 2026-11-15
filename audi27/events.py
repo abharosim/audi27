@@ -341,6 +341,36 @@ def _files(data_dir: str | Path, since=None, until=None) -> list[Path]:
     return kept
 
 
+def snapshot_offsets(data_dir: str | Path) -> dict[str, int]:
+    """Byte offset at the end of each day file. A trailing partial line is not consumed."""
+    offsets: dict[str, int] = {}
+    for path in _files(data_dir):
+        _, offsets[path.name] = _read_complete(path, 0)
+    return offsets
+
+
+def read_new(data_dir: str | Path, offsets: dict[str, int], *, types=None,
+             sources=None) -> tuple[list[dict], dict[str, int]]:
+    """Events appended after `offsets` (day-file name -> byte offset).
+
+    A day file that is not in the map is read from byte 0, so a file created later
+    (the next local day) is not skipped. A trailing partial line stays unconsumed.
+    The input map is not modified; the returned map is the cursor to keep.
+    """
+    want_types, want_sources = _as_set(types), _as_set(sources)
+    cursor: dict[str, int] = {}
+    for key, value in offsets.items():
+        if isinstance(key, str) and type(value) is int and value >= 0:
+            cursor[key] = value
+    found: list[dict] = []
+    for path in _files(data_dir):
+        events, cursor[path.name] = _read_complete(path, cursor.get(path.name, 0))
+        for ev in events:
+            if _accept(ev, None, None, want_types, want_sources):
+                found.append(ev)
+    return found, cursor
+
+
 def replay(data_dir: str | Path, *, since=None, until=None, types=None, sources=None) -> Iterator[dict]:
     """Yield stored events in file order. `since` is inclusive, `until` is exclusive.
 
