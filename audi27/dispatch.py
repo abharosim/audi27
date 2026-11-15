@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .agent import Agent, build_agent, task_event
-from .confirm import classify_answer
+from .confirm import classify_answer, overlaps_playback
 from .events import append, make_event, read_new, replay, snapshot_offsets
 from .route import AGENT_TARGETS
 
@@ -236,9 +236,17 @@ def _parse_ts(value):
     return dt
 
 
+def _confirm_key(ev: dict):
+    """Reject wins a same-timestamp tie, so one clock tick cannot approve and cancel."""
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    rank = 0 if data.get("decision") == "reject" else 1
+    return (_parse_ts(ev.get("ts")) or _EARLIEST, rank, ev.get("id") or "")
+
+
 def _index(data_dir):
-    """Routes, held tasks, read-back times, and confirm events currently in the log."""
+    """Routes, held tasks, read-backs, spoken ends, and confirm events in the log."""
     routes, tasks, briefs, origins, confirms = {}, {}, {}, {}, []
+    spoken_at: dict[str, datetime] = {}
     for ev in replay(data_dir):
         if isinstance(ev.get("id"), str):
             origins[ev["id"]] = ev
@@ -254,12 +262,18 @@ def _index(data_dir):
             }
         elif kind == "brief" and data.get("kind") == "confirm" and isinstance(data.get("task_id"), str):
             when = _parse_ts(ev.get("ts"))
+            if when is not None and isinstance(ev.get("id"), str):
+                briefs.setdefault(data["task_id"], []).append((when, ev["id"]))
+        elif kind == "spoken" and isinstance(ev.get("ref"), str):
+            when = _parse_ts(ev.get("ts"))
             if when is not None:
-                briefs.setdefault(data["task_id"], []).append(when)
+                prev = spoken_at.get(ev["ref"])
+                if prev is None or when < prev:
+                    spoken_at[ev["ref"]] = when
         elif kind == "confirm":
             confirms.append(ev)
-    confirms.sort(key=lambda ev: (_parse_ts(ev.get("ts")) or _EARLIEST, ev.get("id") or ""))
-    return routes, tasks, briefs, origins, confirms
+    confirms.sort(key=_confirm_key)
+    return routes, tasks, briefs, origins, confirms, spoken_at
 
 
 def _expire(tasks, routes, state, emit, now, cfg) -> None:
@@ -277,12 +291,18 @@ def _expire(tasks, routes, state, emit, now, cfg) -> None:
         emit(task_event(route, status="expired", ref=info["id"], adapter=None, ts=now))
 
 
-def _effective(ev, task_id, briefs, origins):
-    """(counts, answer time). A voice answer before the read-back does not count."""
+def _effective(ev, task_id, briefs, origins, spoken_at):
+    """(counts, answer time). A voice answer before the read-back does not count.
+
+    A bare utterance that overlaps the read-back playback does not count either:
+    that is the speaker coming back through the microphone. The caller also
+    drops an answer timestamped before the task itself existed.
+    """
     data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
     source = data.get("source")
     if source == "dashboard":
-        return True, _parse_ts(ev.get("ts"))
+        when = _parse_ts(ev.get("ts"))
+        return when is not None, when
     origin = origins.get(source) if isinstance(source, str) else None
     if origin is None:
         return False, None
@@ -290,8 +310,10 @@ def _effective(ev, task_id, briefs, origins):
     answer = _parse_ts(body.get("start") or origin.get("ts"))
     if answer is None:
         return False, None
-    times = briefs.get(task_id) or []
+    times = [when for when, _bid in (briefs.get(task_id) or [])]
     if not times or answer < min(times):
+        return False, answer
+    if origin.get("type") == "utterance" and overlaps_playback(answer, briefs, spoken_at):
         return False, answer
     return True, answer
 
@@ -307,7 +329,7 @@ def _note_expired(ev, task_id, emit) -> None:
     }, ts=ev.get("ts"), ref=ev.get("id"), id=f"brief-expired-{ev.get('id')}"))
 
 
-def _apply_confirm(ev, tasks, routes, briefs, origins, state, cfg, emit, agents, data_dir) -> None:
+def _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, state, cfg, emit, agents, data_dir) -> None:
     data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
     decision = data.get("decision")
     task_id = data.get("task_id")
@@ -320,10 +342,13 @@ def _apply_confirm(ev, tasks, routes, briefs, origins, state, cfg, emit, agents,
     if route is None:
         return
     route_id = info["route_id"]
-    ok, answer_time = _effective(ev, task_id, briefs, origins)
-    if not ok:
+    ok, answer_time = _effective(ev, task_id, briefs, origins, spoken_at)
+    if not ok or answer_time is None:
         return
     started = _parse_ts(info["ts"])
+    # A confirm written before this task existed must not release it later.
+    if started is None or answer_time < started:
+        return
     deadline = started + timedelta(seconds=float(cfg.confirm.ttl_s)) if started is not None else None
     if (state.get(route_id) == "awaiting_confirmation" and answer_time is not None
             and deadline is not None and answer_time >= deadline):
@@ -347,11 +372,11 @@ def settle(data_dir, cfg, emit, state, agents, now) -> None:
     """
     if not cfg.confirm.enabled:
         return
-    routes, tasks, briefs, origins, confirms = _index(data_dir)
+    routes, tasks, briefs, origins, confirms, spoken_at = _index(data_dir)
     for ev in confirms:
         when = _parse_ts(ev.get("ts")) or now
         _expire(tasks, routes, state, emit, when, cfg)
-        _apply_confirm(ev, tasks, routes, briefs, origins, state, cfg, emit, agents, data_dir)
+        _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, state, cfg, emit, agents, data_dir)
     _expire(tasks, routes, state, emit, now, cfg)
 
 

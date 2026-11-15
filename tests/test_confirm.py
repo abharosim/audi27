@@ -449,11 +449,11 @@ def test_live_confirm_does_not_backfill_and_follows_new_turns(tmp_path):
 # --- dashboard ---------------------------------------------------------------
 
 
-def _post(port, path, body):
+def _post(port, path, body, headers=None):
     raw = json.dumps(body).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=raw, method="POST",
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req) as response:
             return response.status, json.loads(response.read())
@@ -465,12 +465,14 @@ def test_dashboard_approve_writes_the_same_confirm_event_and_dispatches(tmp_path
     from audi27.web import make_server
 
     data = tmp_path / "data"
+    cfg_path = tmp_path / "c.toml"
+    cfg_path.write_text(f'[store]\ndata_dir = "{data}"\n[confirm]\nenabled = true\n', encoding="utf-8")
     # The click is stamped with the wall clock, so the task has to be recent.
     opened = datetime.now(timezone.utc) - timedelta(seconds=20)
     task_id = _open(
         data, when=opened, now=datetime.now(timezone.utc),
         brief_at=opened + timedelta(seconds=1))
-    server = make_server(data, port=0)
+    server = make_server(data, port=0, config_path=str(cfg_path))
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -507,3 +509,246 @@ def test_record_decision_rejects_a_bad_choice():
     except ValueError:
         return
     raise AssertionError("expected ValueError")
+
+
+def _decision(events, phrase, *, bare=False):
+    """The confirm decision `phrase` produces against `events`, or None."""
+    start = "2026-11-15T12:01:10+00:00"
+    if bare:
+        events = events + [utterance("u-probe", phrase, start)]
+    else:
+        events = events + [turn("turn-probe", phrase, start)]
+    for ev in plan(events, window_s=20):
+        if ev["type"] == "confirm":
+            return ev["data"]["decision"]
+    return None
+
+
+def test_questions_negation_and_buried_yes_do_not_approve():
+    task = awaiting("route-pay", "帮我发邮件给张三")
+    brief = readback(task["id"], "发给 Grok：帮我发邮件给张三。确认还是取消？")
+    base = [task, brief]
+    # The whole line is the yes-word: still an approval.
+    assert _decision(base, "确认") == "approve"
+    assert _decision(base, "可以", bare=True) == "approve"
+    assert _decision(base, "book") is None
+    assert _decision(base, "bookmark") is None
+    for phrase in (
+        "不确认", "别确认", "不可以", "不是ok", "不要确认",
+        "可以吗", "可以吗？", "可以?", "可以？", "好的？", "确认？", "ok?", "yes?", "好呢", "可以呢",
+        "好的我想想", "好的我再想想", "好吧我看看",
+        "别取消", "算了吧还是发",
+        "那就好", "那就行", "这个好", "一个好", "可以的话", "帮我确认一下",
+        "好了", "可以了", "行了",
+        "好不好", "行不行",
+    ):
+        assert _decision(base, phrase) != "approve", phrase
+        assert _decision(base, phrase, bare=True) != "approve", phrase
+    # Negating the yes is a no, and it does cancel. It must not approve.
+    assert _decision(base, "不确认") == "reject"
+    assert _decision(base, "不可以") == "reject"
+    # Hesitation that happens to sit inside the task text is still not a yes.
+    think = awaiting("route-think", "帮我想想接下来怎么做")
+    think_brief = readback(think["id"], "发给 Grok：帮我想想。确认还是取消？")
+    assert _decision([think, think_brief], "好的我想想") != "approve"
+    assert _decision([think, think_brief], "好的我想想", bare=True) != "approve"
+
+
+def test_a_name_that_matches_two_tasks_does_not_approve_either():
+    mail = awaiting("route-mail", "发邮件给张三", target="grok", ts=TS)
+    other = awaiting("route-other", "把邮件转给李四", target="muse",
+                     ts="2026-11-15T12:00:30+00:00")
+    events = [
+        mail, other,
+        readback(mail["id"], "发给 Grok：发邮件。确认还是取消？", ts=BRIEF_TS),
+        readback(other["id"], "发给 Muse：转邮件。确认还是取消？",
+                 ts="2026-11-15T12:01:30+00:00"),
+        turn("turn-yes", "确认邮件", "2026-11-15T12:02:00+00:00"),
+    ]
+    decided = [ev for ev in plan(events) if ev["type"] == "confirm"]
+    assert decided == []
+    # One distinctive name still selects that task.
+    events[-1] = turn("turn-yes", "确认发给张三", "2026-11-15T12:02:00+00:00")
+    named = plan(events)
+    assert named[0]["data"]["task_id"] == mail["id"] and named[0]["data"]["decision"] == "approve"
+
+
+def test_an_answer_before_the_second_read_back_stays_on_the_first():
+    first = awaiting("route-mail", "发邮件给张三", ts=TS)
+    second = awaiting("route-post", "帮我发帖", target="muse", ts="2026-11-15T12:00:30+00:00")
+    events = [
+        first, second,
+        readback(first["id"], "发给 Grok：发邮件。确认还是取消？", ts=BRIEF_TS),
+        turn("turn-yes", "确认", "2026-11-15T12:01:20+00:00"),
+        readback(second["id"], "发给 Muse：发帖。确认还是取消？",
+                 ts="2026-11-15T12:01:40+00:00"),
+    ]
+    out = [ev for ev in plan(events) if ev["type"] == "confirm"]
+    assert len(out) == 1 and out[0]["data"]["task_id"] == first["id"]
+
+
+def test_echo_during_playback_cannot_approve_and_a_line_after_it_can():
+    task = awaiting("route-pay", "帮我发邮件给张三")
+    brief = readback(task["id"], "发给 Grok：帮我发邮件给张三。确认还是取消？")
+    spoken = make_event("spoken", "speak", {
+        "text": brief["data"]["summary"], "completed": True, "interrupted": False, "backend": "say",
+        "brief_id": brief["id"],
+    }, ts="2026-11-15T12:01:04+00:00", ref=brief["id"], id="spoken-" + brief["id"])
+    during = utterance("u-echo", "确认", "2026-11-15T12:01:03+00:00")
+    tail = utterance("u-tail", "确认", "2026-11-15T12:01:04.200+00:00")
+    after = utterance("u-yes", "好的", "2026-11-15T12:01:06+00:00")
+    assert plan([task, brief, spoken, during], window_s=20) == []
+    assert plan([task, brief, spoken, tail], window_s=20) == []
+    out = plan([task, brief, spoken, after], window_s=20)
+    assert [ev["data"]["decision"] for ev in out] == ["approve"]
+    # The full read-back, question and all, is not a yes even with no spoken event.
+    echo_line = utterance("u-full", "发给 Grok：帮我发邮件给张三。确认还是取消？",
+                          "2026-11-15T12:01:05+00:00")
+    assert plan([task, brief, echo_line], window_s=20) == []
+
+
+def test_playback_echo_does_not_dispatch_and_a_later_yes_does(tmp_path):
+    data = tmp_path / "data"
+    task_id = _open(data)
+    brief_id = f"brief-{task_id}"
+    append(data, make_event("spoken", "speak", {
+        "text": "发给 Grok：帮我发邮件给张三。确认还是取消？",
+        "completed": True, "interrupted": False, "backend": "say", "brief_id": brief_id,
+    }, ts="2026-11-15T12:01:04+00:00", ref=brief_id, id="spoken-" + brief_id))
+    append(data, utterance("u-echo", "确认", "2026-11-15T12:01:02+00:00"))
+    assert sync(data, cfg_on())["wrote"] == 0
+    # A confirm event that points at the echo is still not an approval.
+    append(data, make_event("confirm", "confirm", {
+        "task_id": task_id, "decision": "approve", "source": "u-echo",
+    }, ts="2026-11-15T12:01:02+00:00", ref=task_id, id="confirm-echo"))
+    agent = CountFake()
+    assert dispatch_all(data, cfg_on(), agents={"fake": agent}, now=NOW)["wrote"] == 0
+    assert agent.calls == []
+    append(data, utterance("u-yes", "确认", "2026-11-15T12:01:06+00:00"))
+    assert sync(data, cfg_on())["wrote"] == 1
+    assert dispatch_all(data, cfg_on(), agents={"fake": agent}, now=NOW)["wrote"] >= 1
+    assert agent.calls == ["route-pay"]
+
+
+def test_same_timestamp_reject_wins_and_a_confirm_from_before_the_task_does_not(tmp_path):
+    data = tmp_path / "data"
+    task_id = _open(data)
+    when = "2026-11-15T12:02:00+00:00"
+    append(data, turn("turn-no", "取消", when))
+    append(data, turn("turn-yes", "确认", when))
+    sync(data, cfg_on())
+    agent = CountFake()
+    dispatch_all(data, cfg_on(), agents={"fake": agent}, now=NOW)
+    assert agent.calls == []
+    assert "cancelled" in statuses(data)
+    assert "sent" not in statuses(data)
+
+    data2 = tmp_path / "early"
+    early_task = _open(data2)
+    append(data2, make_event("confirm", "confirm", {
+        "task_id": early_task, "decision": "approve", "source": "dashboard",
+    }, ts="2026-11-15T11:00:00+00:00", ref=early_task, id="confirm-early"))
+    agent2 = CountFake()
+    dispatch_all(data2, cfg_on(), agents={"fake": agent2}, now=NOW)
+    assert agent2.calls == []
+    assert statuses(data2) == ["awaiting_confirmation"]
+
+
+def test_cross_day_answer_uses_the_timestamp_not_the_file_order():
+    # 00:10 +08 on the 16th is 16:10 UTC on the 15th, after the task. The
+    # calendar date changes; the comparison is the instant, not the filename.
+    task = awaiting("route-pay", "帮我发邮件给张三", ts="2026-11-15T16:00:00+00:00")
+    brief = readback(task["id"], "发给 Grok：发邮件。确认还是取消？",
+                     ts="2026-11-16T00:10:00+08:00")
+    before = turn("turn-before", "确认", "2026-11-15T23:00:00+08:00")
+    after = turn("turn-after", "确认", "2026-11-16T00:20:00+08:00")
+    assert plan([task, brief, before]) == []
+    out = plan([task, brief, after])
+    assert [ev["data"]["decision"] for ev in out if ev["type"] == "confirm"] == ["approve"]
+
+
+def test_confirm_allows_only_a_loopback_host():
+    from audi27.web import _loopback_host
+
+    assert _loopback_host("127.0.0.1") and _loopback_host("127.0.0.1:8727")
+    assert _loopback_host("localhost") and _loopback_host("[::1]:8727")
+    assert not _loopback_host("0.0.0.0") and not _loopback_host("0.0.0.0:8727")
+    assert not _loopback_host("evil.example") and not _loopback_host(None)
+    assert not _loopback_host("127.0.0.1.evil.example")
+
+
+def test_confirm_endpoint_refuses_cross_site_get_and_a_gate_that_is_off(tmp_path):
+    from audi27.web import make_server
+
+    data = tmp_path / "data"
+    off = tmp_path / "off.toml"
+    off.write_text(f'[store]\ndata_dir = "{data}"\n[confirm]\nenabled = false\n', encoding="utf-8")
+    on = tmp_path / "on.toml"
+    on.write_text(f'[store]\ndata_dir = "{data}"\n[confirm]\nenabled = true\n', encoding="utf-8")
+    opened = datetime.now(timezone.utc) - timedelta(seconds=30)
+    task_id = _open(data, when=opened, now=datetime.now(timezone.utc),
+                    brief_at=opened + timedelta(seconds=1))
+
+    def serve(cfg):
+        server = make_server(data, port=0, config_path=str(cfg))
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, port
+
+    server, port = serve(off)
+    try:
+        code, body = _post(port, "/api/confirm", {"task_id": task_id, "decision": "approve"})
+        assert code == 403 and "off" in body["error"]
+        assert confirms(data) == []
+        # GET must not approve, even if the query string looks like a decision.
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/confirm?task_id={task_id}&decision=approve")
+            raise AssertionError("GET /api/confirm was accepted")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert confirms(data) == []
+
+    server, port = serve(on)
+    try:
+        # A form body, and a content type that only contains the letters application/json.
+        raw = json.dumps({"task_id": task_id, "decision": "approve"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/confirm", data=raw, method="POST",
+            headers={"Content-Type": "text/plain;charset=application/json"})
+        try:
+            urllib.request.urlopen(req)
+            raise AssertionError("form-like content type was accepted")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 415
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/confirm", data=raw, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            urllib.request.urlopen(req)
+            raise AssertionError("form post was accepted")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 415
+        code, body = _post(port, "/api/confirm", {"task_id": task_id, "decision": "approve"},
+                           {"Origin": "http://evil.example", "Host": "evil.example"})
+        # urllib's Host may be overwritten by the URL host. Origin mismatch is enough.
+        assert code == 403
+        code, body = _post(port, "/api/confirm", {"task_id": task_id, "decision": "approve"},
+                           {"Sec-Fetch-Site": "cross-site"})
+        assert code == 403
+        code, body = _post(port, "/api/confirm", {"task_id": "task-not-real", "decision": "approve"})
+        assert code == 400
+        code, body = _post(port, "/api/confirm", {"task_id": 12, "decision": "approve"})
+        assert code == 400
+        assert confirms(data) == []
+        code, saved = _post(port, "/api/confirm", {"task_id": task_id, "decision": "approve"})
+        assert code == 200 and saved["data"]["decision"] == "approve"
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/loop") as response:
+            payload = json.loads(response.read())
+        assert payload["confirm"] is True
+    finally:
+        server.shutdown()
+        server.server_close()

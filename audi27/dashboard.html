@@ -632,7 +632,7 @@ async function loadLoop() {
   for (const r of rows) {
     const tr = el('tr');
     const said = el('td', 'turn', r.summary || '');
-    if (r.status === 'awaiting_confirmation' && r.task_id) {
+    if (d.confirm && r.status === 'awaiting_confirmation' && r.task_id) {
       const yes = el('button', 'btn small', '确认');
       yes.title = '批准这件事'; yes.setAttribute('aria-label', '确认');
       yes.onclick = () => confirmTask(r.task_id, 'approve');
