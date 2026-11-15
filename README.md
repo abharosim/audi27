@@ -46,6 +46,8 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 queue show` | 用事件流重算队列，只打印 |
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
+| `audi27 grokbot test "文本"` | 向 Grok Bot webhook 发一条测试 POST，打印 HTTP 状态码 |
+| `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
 | `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
@@ -102,7 +104,8 @@ uv run audi27 route run                           # 常驻写 route
 
 这三步把回路接上，但默认都不执行。`[dispatch] enabled`、`[queue] enabled`、`[speak] enabled` 都是 `false`，`./start.sh` 不会拉起它们。路由继续只显示。要跑的时候再开，或者手动执行下面的命令。
 
-- **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器；口头确认留到后面。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器（Claude Code、Grok、Muse、本地模型）以后按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
+- **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器；口头确认留到后面。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
+- **Grok Bot** 没有 SDK。只有 `[dispatch.adapters]` 里写了 `grok = "grokbot"` 才会真的发出去，默认仍是 `fake`。`dispatch run` 在 POST 之前先写 `task`（`sent`），JSON 体是 `task_id`、`route_id`、`text`（分给 Grok 的那句）、`ts`，可选 `context`（最近几条 utterance，`context_utterances`，默认 0 不带）。超时约 10 秒，只有网络错误重试一次；非 2xx 记失败。URL 和密钥不进 `config.toml`，放环境变量或项目根的 `.env`（已 gitignore）：`AUDI27_GROKBOT_WEBHOOK_URL`、`AUDI27_GROKBOT_WEBHOOK_KEY`。默认请求头是 `Authorization: Bearer <key>`。Grok Bot 要的头还没定，改 `[grokbot]` 的 `header_name` 和 `header_value`，模板里的 `{key}` 会换成那个密钥，例如 `header_name = "X-Webhook-Key"`、`header_value = "{key}"`。做完后它把回复写到 `data/inbox/grokbot/<task_id>.json`（`{"task_id","route_id","status":"done"|"failed"|"needs_decision","summary","text"}`）。`done` 是普通回复，`needs_decision` 进队列的 decision，`failed` 记一条失败（队列里是 error）。同一 `task_id` 不会重复写事件。格式不对、或不认识的 `task_id`，移到 `inbox/grokbot/quarantine/` 并在日志里记一条错误。JSON 解析失败先留着，连着几个 tick 还不行再隔离。超过 `reply_timeout_s`（默认 1800 秒）还没有回复，失败原因是「Grok Bot 没有回复」；超时之后文件才到，仍然写 reply。`dispatch run` 会一起看这个目录，所以不用再开一个进程；也可以单独跑 `audi27 grokbot inbox`。`audi27 grokbot test "文本"` 发一条测试 POST，打印 HTTP 状态码。
 - **队列** `audi27 queue run` 把 `reply` 和失败的 `task` 收成 `brief`。优先级是 decision > error > done > info。一次只放出一条，等 `spoken` 之后才放下一条；已经在念的不会被后来的更高优先级打断。摘要是第一句，超长截断；`summarize_fn` 是以后接模型的钩子，现在不调用。队列指令（target `queue`）：详细说说念全文，跳过丢掉当前条，稍后放到队尾，还有什么列剩下的，关掉清空。状态靠重放事件恢复，不另存一份。`audi27 queue show` 重放整段日志并打印，不写 brief。`queue run` 第一次启动不汇报历史，重启从那次的位置重放。
 - **播报** `audi27 speak run` 按 brief 的顺序调用 macOS `say`（`[speak] voice`，默认 `Tingting`）。写出 `spoken`：念了什么、是否念完、是否被打断。录音心跳 `data/status.json` 的 `speaking` 为真时不开始；念到一半变成真就停掉 `say`。心跳大约 0.4 秒写一次，所以停下来比设计里的 0.2 秒慢，要更快得改采集端。没有 `say`（比如 Linux 上的测试）就记一条日志，进程不退出。`say` 报不出念到第几个字，`text` 是交给它的整句。`audi27 speak test "文字"` 只试这一句，不写事件。第一次启动不补历史。
 
@@ -189,7 +192,7 @@ echo "改了什么" > data/restart.request
 - **表格**：一行一段录音，一列一个标签。和基准列不同的字词高亮；各列完全一致的行默认隐藏。列多了表格横向滚动，每列不窄于 300 px，文字始终完整换行。
 - **判定**：点哪一格就是判哪一格正确（可多选），或点"都不对"。结果存在 `data/verdicts.jsonl`，保存的是被判正确的文本，
   所以以后新跑的标签会自动按这些答案计分。
-- **密钥**：云端后端的 key 写在项目根目录的 `.env`（已 gitignore），例如 `OPENAI_API_KEY=...`，重启后生效。
+- **密钥**：云端后端的 key 写在项目根目录的 `.env`（已 gitignore），例如 `OPENAI_API_KEY=...`，重启后生效。Grok Bot 的 webhook 也写在这里：`AUDI27_GROKBOT_WEBHOOK_URL` 和 `AUDI27_GROKBOT_WEBHOOK_KEY`。
 
 ## 语气词与上下文纠错
 
