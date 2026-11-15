@@ -54,7 +54,7 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
-| `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
+| `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表、任务状态 |
 
 ## 事件流
 
@@ -178,6 +178,8 @@ backends = ["mlx_whisper", "openai"]
 `audi27 web` 是只读的，只绑定 127.0.0.1。录音进程每 0.4 秒把心跳写到 `data/status.json`
 （音量、是否在说话、积压、丢帧），仪表盘据此判断是否在运行：心跳超过 3 秒没更新即显示"未运行"。
 `[presence]` 打开时另写的 `data/presence.json` 只给播报用，仪表盘仍看这份心跳。
+
+转写列表上面有一块「任务」，每 3 秒读一次 `GET /api/tasks`。进行中是已经分派、还没有回复的；待播报是还在队列里的回复、还没念的失败，以及 `[confirm]` 开着时还没念的确认读回；最近完成留下 10 条（已播报、已经离开队列的失败、念完的待决定、以及 `inbox/grokbot/quarantine/` 里的文件）。只重放昨天和今天的事件，和下面的回路共用这一份。不写、也不改变分派。不用改 `config.toml`。
 
 ## 回放与模型对比
 
