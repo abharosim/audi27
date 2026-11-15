@@ -126,7 +126,7 @@ def cmd_supervise(args, cfg) -> int:
     supervisor.main(args.config, cfg.store.data_dir, args.host, args.port,
                     turns=cfg.turns.enabled, route=cfg.route.enabled,
                     dispatch=cfg.dispatch.enabled, queue=cfg.queue.enabled,
-                    speak=cfg.speak.enabled)
+                    speak=cfg.speak.enabled, screen=cfg.screen.enabled)
     return 0
 
 
@@ -193,7 +193,7 @@ def cmd_events(args, cfg) -> int:
 
 
 def cmd_turns(args, cfg) -> int:
-    from .turns import assemble_replay, format_turn, serve, turn_event, write_turn_file, write_turns
+    from .turns import assemble_replay, event_for_turn, format_turn, serve, write_turn_file, write_turns
 
     data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
     if args.turns_cmd == "run":
@@ -216,13 +216,13 @@ def cmd_turns(args, cfg) -> int:
         return 2
     turns, stats = assemble_replay(data_dir, cfg, since=since, until=until)
     if getattr(args, "output", None):
-        write_turn_file(args.output, turns)
+        write_turn_file(args.output, turns, data_dir, cfg)
     if getattr(args, "write", False):
-        result = write_turns(data_dir, turns)
+        result = write_turns(data_dir, turns, cfg)
         print(f"wrote {result['wrote']}, already present {result['skipped']}", file=sys.stderr)
     for turn in turns:
         if args.json:
-            print(json.dumps(turn_event(turn), ensure_ascii=False), flush=True)
+            print(json.dumps(event_for_turn(data_dir, cfg, turn), ensure_ascii=False), flush=True)
         else:
             print(format_turn(turn), flush=True)
     print(f"turns found: {stats['turns']}, utterances merged: {stats['utterances']}", file=sys.stderr)
@@ -376,6 +376,26 @@ def cmd_speak(args, cfg) -> int:
     return 0
 
 
+def cmd_screen(args, cfg) -> int:
+    from .screen import serve
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    if not cfg.screen.enabled:
+        print("screen is off ([screen] enabled = false); not sampling", file=sys.stderr)
+        return 0
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll or None)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_search(args, cfg) -> int:
     data_dir = args.data_dir or cfg.store.data_dir
     try:
@@ -499,6 +519,12 @@ def main(argv=None) -> int:
     stest = ssub.add_parser("test", help="speak one line and print what the backend did")
     stest.add_argument("text")
     sp.set_defaults(fn=cmd_speak)
+    sc = sub.add_parser("screen", help="record the frontmost app and window title")
+    scsub = sc.add_subparsers(dest="screen_cmd", required=True)
+    scrun = scsub.add_parser("run", help="sample the front window and emit screen events on change")
+    scrun.add_argument("--data-dir")
+    scrun.add_argument("--poll", type=float, default=0, help="seconds between samples; 0 uses screen.poll_s")
+    sc.set_defaults(fn=cmd_screen)
     e = sub.add_parser("eval", help="replay stored audio through other backends and compare")
     e.add_argument("--data-dir")
     esub = e.add_subparsers(dest="eval_cmd", required=True)

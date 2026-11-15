@@ -46,6 +46,7 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 queue show` | 用事件流重算队列，只打印 |
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
+| `audi27 screen run` | 记录最前面的应用和窗口标题（默认关，仅 macOS 真正采样） |
 | `audi27 grokbot test "文本"` | 向 Grok Bot webhook 发一条测试 POST，打印 HTTP 状态码 |
 | `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
@@ -177,7 +178,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[screen]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
 
 改完代码后重启，不需要碰那个终端：
 
@@ -187,6 +188,16 @@ echo "改了什么" > data/restart.request
 
 守护进程每秒检查一次这个文件：先让录音进程把最后一段写完再退出，`pyproject.toml` 变了就先 `uv sync`，
 然后重新执行自己，所以所有代码改动（包括守护进程本身）都会生效。`data/supervisor.json` 记录 pid、启动时间和重启次数。
+
+## 屏幕上下文
+
+`[screen] enabled` 默认关。关掉时不采样、不写 `screen` 事件，turn 和 route 跟以前一样。打开后 `./start.sh` 会拉起 `audi27 screen run`。
+
+只记录最前面的应用名、bundle id 和最前窗口的标题。不截图、不做 OCR、不读窗口里的文字。macOS 上应用名来自 `lsappinfo`；窗口标题来自 `osascript`，需要给运行 audi27 的程序辅助功能权限，拒绝的话只记应用名，并且只警告一次。不是 macOS 就打一条日志，不写事件。
+
+应用或标题变了，并且稳住 `debounce_s`（默认 1 秒）才写一条，所以快速切换不会刷屏。`exclude_apps` 默认有 1Password、Bitwarden、钥匙串访问；命中时只留应用名，标题抹掉。银行类应用写在这个列表里。无痕窗口（标题里能看出 incognito、inprivate、无痕等）和 `redact_title_patterns` 会整段丢掉标题。标题最长 `max_title_chars`（默认 200）。
+
+轮次结束时，如果当时最近的一条 `screen` 不超过 `stale_s`（默认 3600 秒），就记在 turn 上，route 再抄过去。发给 Grok Bot 还要另开 `[grokbot] include_screen`（默认关）。
 
 ## 对比页（仪表盘 → 模型对比）
 

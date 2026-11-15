@@ -253,6 +253,48 @@ def test_context_is_the_last_few_utterances(tmp_path, webhook, monkeypatch):
     assert body["context"] == ["第二句", "第三句"]
 
 
+def _with_screen(event, title="main.py", *, redacted=False):
+    event["data"]["screen"] = {
+        "app": "Cursor", "bundle_id": "com.cursor", "title": title, "title_redacted": redacted,
+    }
+    return event
+
+
+def test_screen_stays_off_the_post_unless_include_screen(tmp_path, webhook, monkeypatch):
+    box, url = webhook
+    data = tmp_path / "data"
+    cfg = grok_cfg(data, url=url, monkeypatch=monkeypatch)
+    hidden = _with_screen(route("route-off"), "secret-title")
+    dispatch_one(hidden, cfg, appending(data), data_dir=data)
+    raw = box.requests[0]["raw"].decode()
+    body = json.loads(raw)
+    assert "context" not in body
+    assert "secret-title" not in raw
+
+    cfg.grokbot.include_screen = True
+    dispatch_one(_with_screen(route("route-on")), cfg, appending(data), data_dir=data)
+    body = json.loads(box.requests[1]["raw"].decode())
+    assert body["context"] == {
+        "screen": {
+            "app": "Cursor", "bundle_id": "com.cursor", "title": "main.py", "title_redacted": False,
+        },
+    }
+
+    cfg.grokbot.context_utterances = 1
+    append(data, utterance("u1", "旁边一句"))
+    dispatch_one(_with_screen(route("route-both"), "both.py"), cfg, appending(data), data_dir=data)
+    body = json.loads(box.requests[2]["raw"].decode())
+    assert body["context"]["utterances"] == ["旁边一句"]
+    assert body["context"]["screen"]["title"] == "both.py"
+
+    redacted = _with_screen(route("route-red"), "hunter2", redacted=True)
+    dispatch_one(redacted, cfg, appending(data), data_dir=data)
+    raw = box.requests[3]["raw"].decode()
+    assert "hunter2" not in raw
+    assert json.loads(raw)["context"]["screen"]["title"] is None
+    assert json.loads(raw)["context"]["screen"]["title_redacted"] is True
+
+
 def test_duplicate_reply_file_emits_once(tmp_path):
     data = tmp_path / "data"
     cfg = C.Config()
@@ -463,6 +505,7 @@ def test_grokbot_config_defaults_and_rejects_secrets_and_bad_values(tmp_path):
     assert cfg.grokbot.header_value == "Bearer {key}"
     assert cfg.grokbot.timeout_s == 10
     assert cfg.grokbot.context_utterances == 0
+    assert cfg.grokbot.include_screen is False
     assert cfg.grokbot.reply_timeout_s == 1800
     assert cfg.grokbot.parse_retries == 3
     example = C.load(Path(__file__).resolve().parents[1] / "config.example.toml")

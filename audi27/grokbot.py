@@ -270,6 +270,29 @@ def post_webhook(url: str, payload: dict, *, header_name: str, header_value: str
     raise last
 
 
+def screen_from_route(route: dict) -> dict | None:
+    """App and title stored on the route, or None. A redacted title is not forwarded."""
+    data = route.get("data") if isinstance(route.get("data"), dict) else {}
+    screen = data.get("screen")
+    if not isinstance(screen, dict):
+        return None
+    app = screen.get("app")
+    if not isinstance(app, str) or not app.strip():
+        return None
+    bundle = screen.get("bundle_id") if isinstance(screen.get("bundle_id"), str) else ""
+    title = screen.get("title")
+    if screen.get("title_redacted") or not isinstance(title, str):
+        title = None
+    else:
+        title = " ".join("".join(ch if ch.isprintable() else " " for ch in title).split())
+    return {
+        "app": app.strip()[:200],
+        "bundle_id": bundle.strip()[:200],
+        "title": title,
+        "title_redacted": bool(screen.get("title_redacted")),
+    }
+
+
 def recent_utterances(data_dir, n: int) -> list[str]:
     """The last `n` non-rejected utterance texts, oldest first. Empty when `n` is 0."""
     if n <= 0:
@@ -291,7 +314,7 @@ class GrokbotAgent(Agent):
     name = ADAPTER
 
     def __init__(self, *, data_dir, url: str, key: str, header_name: str, header_value: str,
-                 timeout_s: float, context_utterances: int):
+                 timeout_s: float, context_utterances: int, include_screen: bool = False):
         self.data_dir = str(data_dir)
         self.url = url
         self.key = key
@@ -299,6 +322,7 @@ class GrokbotAgent(Agent):
         self.header_value = header_value
         self.timeout_s = float(timeout_s)
         self.context_utterances = int(context_utterances)
+        self.include_screen = bool(include_screen)
 
     @classmethod
     def from_cfg(cls, cfg) -> "GrokbotAgent":
@@ -311,7 +335,25 @@ class GrokbotAgent(Agent):
             header_value=g.header_value,
             timeout_s=g.timeout_s,
             context_utterances=g.context_utterances,
+            include_screen=g.include_screen,
         )
+
+    def _context(self, route: dict):
+        """Utterance list, screen object, or both. None when the POST should omit `context`.
+
+        With `include_screen` off, this is the list of recent utterances (or None
+        when that count is 0), which is the previous payload. With it on, screen
+        is added and the value becomes an object so the list shape is unchanged
+        for callers that did not ask for screen context.
+        """
+        texts = recent_utterances(self.data_dir, self.context_utterances) if self.context_utterances > 0 else None
+        screen = screen_from_route(route) if self.include_screen else None
+        if screen is None:
+            return texts
+        body = {"screen": screen}
+        if texts is not None:
+            body["utterances"] = texts
+        return body
 
     def handle(self, route: dict, emit) -> None:
         url = self.url.strip() if isinstance(self.url, str) else ""
@@ -328,8 +370,9 @@ class GrokbotAgent(Agent):
             "text": route_text(route),
             "ts": now.isoformat(timespec="milliseconds"),
         }
-        if self.context_utterances > 0:
-            payload["context"] = recent_utterances(self.data_dir, self.context_utterances)
+        context = self._context(route)
+        if context is not None:
+            payload["context"] = context
         try:
             status, body = post_webhook(
                 url, payload, header_name=self.header_name, header_value=self.header_value,
