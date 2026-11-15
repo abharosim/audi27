@@ -1,6 +1,7 @@
 """The whole loop, through the event files only: utterance -> spoken, refs intact."""
 import json
 import threading
+from datetime import datetime
 
 from audi27 import config as C
 from audi27.cli import main
@@ -123,7 +124,7 @@ def test_dashboard_lists_tasks_replies_and_briefs(tmp_path):
     from audi27.web import make_server
 
     data = tmp_path / "data"
-    ts = "2026-11-15T12:00:00+00:00"
+    ts = datetime.now().astimezone().isoformat()
     append(data, make_event("task", "dispatch", {
         "route_id": "route-1", "target": "grok", "adapter": "fake", "status": "done", "text": "天气",
     }, ts=ts, ref="route-1", id="task-1"))

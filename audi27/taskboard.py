@@ -4,19 +4,24 @@ Three lists, folded from the event log (and the grokbot quarantine directory):
 
 - running: a task was dispatched (`sent` / `running` / `done`) and no reply
   has arrived, and it has not failed
-- waiting: a reply is still in the report queue, so it has not been spoken
-- recent: the last few that finished — spoken, failed, a spoken
-  `needs_decision`, or a file left in `inbox/grokbot/quarantine/`
+- waiting: still in the report queue — a reply, a failed task whose error
+  has not been spoken or dropped, or (when the confirm gate is on) an
+  `awaiting_confirmation` read-back
+- recent: the last few that left that queue, or a file left in
+  `inbox/grokbot/quarantine/`
 
-Nothing here writes. Dispatch, the queue, and the inbox are unchanged.
+The dashboard only replays yesterday and today. One process-wide cache of
+that window is shared with the loop list. Nothing here writes. Dispatch,
+the queue, and the inbox are unchanged.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .events import replay
+from .events import events_dir, replay
 from .grokbot import inbox_dir
 from .queue import ReportQueue
 
@@ -24,10 +29,36 @@ _OPEN = frozenset({"sent", "running", "done"})
 _MAX_QUARANTINE_BYTES = 1024 * 1024
 _TEXT_LIMIT = 80
 _RECENT_LIMIT = 10
+_EVENT_TYPES = ("task", "reply", "brief", "spoken", "confirm", "route")
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict[str, tuple] = {}
+
+
+def window_start(now: datetime) -> datetime:
+    """Local midnight at the start of yesterday. `replay(since=...)` drops older day files."""
+    local = _aware(now).astimezone()
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=1)
+
+
+def load_events(data_dir, *, now: datetime | None = None) -> list[dict]:
+    """Events from yesterday and today. A second call reuses the list while the files are unchanged."""
+    now = datetime.now().astimezone() if now is None else _aware(now)
+    since = window_start(now)
+    key = str(Path(data_dir).resolve())
+    signature = (since.isoformat(), _signature(data_dir, since))
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit is not None and hit[0] == signature:
+            return hit[1]
+    events = list(replay(data_dir, since=since, types=_EVENT_TYPES))
+    with _CACHE_LOCK:
+        _CACHE[key] = (signature, events)
+    return events
 
 
 def derive(events, *, now: datetime, quarantine=None, text_limit: int = _TEXT_LIMIT,
-           recent_limit: int = _RECENT_LIMIT) -> dict:
+           recent_limit: int = _RECENT_LIMIT, confirm: bool = False) -> dict:
     """Fold `events` into ``{"running", "waiting", "recent"}``.
 
     `quarantine` is a list of dicts (`name`, `at`, `task_id`, `route_id`, `text`)
@@ -52,7 +83,7 @@ def derive(events, *, now: datetime, quarantine=None, text_limit: int = _TEXT_LI
         elif kind == "reply":
             _note_reply(routes, ev, data)
 
-    queued = _queued_ids(events)
+    queued = _queued_ids(events, confirm=confirm)
     reply_ids = {rec["reply_id"] for rec in routes.values() if rec.get("reply_id")}
     spoken_at: dict[str, datetime] = {}
     for ev in events:
@@ -87,10 +118,24 @@ def derive(events, *, now: datetime, quarantine=None, text_limit: int = _TEXT_LI
         if reply_id:
             # The reply was skipped or closed before it was spoken.
             continue
+        failed_id = rec.get("failed_id")
+        if rec.get("status") == "failed" and failed_id in queued:
+            waiting.append(_listed(
+                rec, id=route_id, status="failed", origin=rec.get("dispatch_at"),
+                since="dispatch", now=now, text_limit=text_limit, finish=rec.get("failed_at"),
+            ))
+            continue
         if rec.get("status") == "failed":
             recent.append(_listed(
                 rec, id=route_id, status="failed", origin=rec.get("dispatch_at"),
                 since="dispatch", now=now, text_limit=text_limit, finish=rec.get("failed_at"),
+            ))
+            continue
+        confirm_id = rec.get("confirm_id")
+        if rec.get("status") == "awaiting_confirmation" and confirm_id in queued:
+            waiting.append(_listed(
+                rec, id=route_id, status="awaiting_confirmation", origin=rec.get("dispatch_at"),
+                since="dispatch", now=now, text_limit=text_limit, finish=rec.get("dispatch_at"),
             ))
             continue
         if rec.get("status") in _OPEN:
@@ -116,16 +161,18 @@ def derive(events, *, now: datetime, quarantine=None, text_limit: int = _TEXT_LI
 
 
 def snapshot(data_dir, *, now: datetime | None = None, text_limit: int = _TEXT_LIMIT,
-             recent_limit: int = _RECENT_LIMIT) -> dict:
-    """Replay the log and read `inbox/grokbot/quarantine/`. Does not write."""
+             recent_limit: int = _RECENT_LIMIT, confirm: bool = False) -> dict:
+    """Replay yesterday and today, and read `inbox/grokbot/quarantine/`. Does not write.
+
+    `confirm` is `[confirm] enabled`. On, an `awaiting_confirmation` task that
+    the report queue has not spoken yet is waiting to be read back.
+    """
     if now is None:
         now = datetime.now().astimezone()
-    events = list(replay(
-        data_dir, types=("task", "reply", "brief", "spoken", "route"),
-    ))
+    events = load_events(data_dir, now=now)
     return derive(
         events, now=now, quarantine=_quarantine(data_dir),
-        text_limit=text_limit, recent_limit=recent_limit,
+        text_limit=text_limit, recent_limit=recent_limit, confirm=confirm,
     )
 
 
@@ -151,6 +198,10 @@ def _note_task(routes: dict, by_task: dict, ev: dict, data: dict) -> None:
         rec["dispatch_at"] = when
     if status == "failed":
         rec["failed_at"] = when
+        if isinstance(ident, str):
+            rec["failed_id"] = ident
+    elif status == "awaiting_confirmation" and isinstance(ident, str):
+        rec["confirm_id"] = ident
     if status:
         rec["status"] = status
 
@@ -176,6 +227,7 @@ def _blank() -> dict:
         "text": "", "target": "", "adapter": "", "status": "",
         "dispatch_at": None, "reply_at": None, "failed_at": None,
         "reply_id": None, "needs_decision": False, "saw_sent": False,
+        "failed_id": None, "confirm_id": None,
     }
 
 
@@ -188,9 +240,9 @@ def _fill_who(rec: dict, data: dict) -> None:
         rec["adapter"] = adapter
 
 
-def _queued_ids(events: list) -> set[str]:
-    """Reply (and failed-task) ids the report queue has not spoken yet."""
-    queue = ReportQueue()
+def _queued_ids(events: list, *, confirm: bool = False) -> set[str]:
+    """Ids the report queue has not spoken or dropped yet."""
+    queue = ReportQueue(confirm=confirm)
     queue.push_all(events)
     queued = {item.id for item in queue.items}
     if queue.inflight is not None:
@@ -308,6 +360,27 @@ def _aware(now: datetime) -> datetime:
     if now.tzinfo is None or now.utcoffset() is None:
         return now.astimezone()
     return now
+
+
+def _signature(data_dir, since: datetime) -> tuple:
+    """Name, mtime, and size of the day files `replay` would open for `since`."""
+    root = events_dir(data_dir)
+    if not root.is_dir():
+        return ()
+    start = since.astimezone().strftime("%Y-%m-%d")
+    rows = []
+    for path in sorted(root.glob("*.jsonl")):
+        if not path.is_file():
+            continue
+        day = path.stem
+        if len(day) == 10 and day[4] == "-" and day[7] == "-" and day < start:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        rows.append((path.name, st.st_mtime_ns, st.st_size))
+    return tuple(rows)
 
 
 def _quarantine(data_dir) -> list[dict]:

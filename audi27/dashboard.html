@@ -147,7 +147,7 @@
 
   <section id="taskBoard" class="taskboard" aria-label="任务状态">
     <h2>任务</h2>
-    <p class="hint">进行中：已经分派、还没有回复。待播报：回复已在队列里、还没有念。最近完成留 10 条。只读，每 3 秒刷新。</p>
+    <p class="hint">进行中：已经分派、还没有回复。待播报：回复、失败，或待确认的读回还在队列里、还没有念。最近完成留 10 条。只看昨天和今天。只读，每 3 秒刷新。</p>
     <h3>进行中</h3>
     <div id="taskRunning"><div class="empty taskempty">读取中…</div></div>
     <h3>待播报</h3>
@@ -575,10 +575,12 @@ const TARGETS = {grok: 'Grok', muse: 'Muse', claude_code: 'Claude Code', local: 
 const TASK_STATUS = {
   sent: '已发出', running: '进行中', done: '已完成', queued: '待播报',
   spoken: '已播报', failed: '失败', needs_decision: '待决定', quarantined: '已隔离',
+  awaiting_confirmation: '待确认',
 };
 const TASK_CLASS = {
   sent: 'st-accent', running: 'st-accent', done: 'st-ok', queued: 'st-warn',
   needs_decision: 'st-warn', spoken: 'st-ok', failed: 'st-bad', quarantined: 'st-bad',
+  awaiting_confirmation: 'st-warn',
 };
 const TASK_SINCE = {dispatch: '分派后', reply: '回复后', file: '隔离后'};
 const TASK_EMPTY = {running: '没有进行中的任务', waiting: '没有待播报的回复', recent: '没有最近完成的任务'};

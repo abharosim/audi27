@@ -19,11 +19,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import config as C
 from . import evals as E
-from .events import replay
 from .route import list_routes, save_route_verdict
 from .status import read_status
 from .store import clean_json, parse_when, search
-from .taskboard import snapshot as task_snapshot
+from .taskboard import load_events, snapshot as task_snapshot
 from .transcribers import TranscribeError
 
 log = logging.getLogger("audi27.web")
@@ -194,7 +193,7 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                         raise ValueError("limit must be 1..1000")
                     self._json(list_routes(root, limit=limit))
                 elif url.path == "/api/tasks":
-                    self._json(task_snapshot(root))
+                    self._json(task_snapshot(root, confirm=bool(load_cfg().confirm.enabled)))
                 elif url.path == "/api/loop":
                     limit = int(q.get("limit", 200))
                     if limit < 1 or limit > 1000:
@@ -300,9 +299,12 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
 
 
 def list_loop(root, *, limit: int = 200) -> dict:
-    """Recent task / reply / brief / spoken / confirm events, newest first. Read-only."""
+    """Recent task / reply / brief / spoken / confirm events, newest first. Read-only.
+
+    Uses the same yesterday-and-today cache as `/api/tasks`.
+    """
     rows = []
-    for ev in replay(root):
+    for ev in load_events(root):
         if ev.get("type") not in ("task", "reply", "brief", "spoken", "confirm"):
             continue
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}

@@ -168,17 +168,35 @@ def test_close_drops_replies_that_were_not_released():
     assert board["recent"] == [] and board["running"] == []
 
 
-def test_failed_task_is_recent_and_not_running():
+def test_failed_task_waits_in_the_queue_until_the_error_is_spoken():
+    failed = task("route-1", "failed", "查一下账单", "2026-11-15T12:01:40+00:00", error="Grok Bot 没有回复")
     events = [
         task("route-1", "sent", "查一下账单", SENT),
         task("route-1", "running", "查一下账单", RUNNING_AT),
-        task("route-1", "failed", "查一下账单", "2026-11-15T12:01:40+00:00", error="Grok Bot 没有回复"),
+        failed,
     ]
     board = derive(events, now=NOW)
-    assert board["running"] == [] and board["waiting"] == []
-    row = board["recent"][0]
+    assert board["running"] == [] and board["recent"] == []
+    row = board["waiting"][0]
     assert row["status"] == "failed" and row["text"] == "查一下账单"
     assert row["since"] == "dispatch" and row["elapsed_s"] == 120.0
+
+    events.append(spoken("brief-" + failed["id"], "2026-11-15T12:01:50+00:00"))
+    done = derive(events, now=NOW)
+    assert done["waiting"] == [] and done["running"] == []
+    assert done["recent"][0]["status"] == "failed"
+    assert done["recent"][0]["id"] == "route-1"
+
+
+def test_failure_dropped_by_close_leaves_the_queue_and_is_recent():
+    events = [
+        task("route-a", "failed", "甲", SENT, ident="task-a-failed"),
+        task("route-b", "failed", "乙", REPLY_AT, ident="task-b-failed"),
+        close(),
+    ]
+    board = derive(events, now=NOW)
+    assert [(row["id"], row["status"]) for row in board["waiting"]] == [("route-a", "failed")]
+    assert [(row["id"], row["status"]) for row in board["recent"]] == [("route-b", "failed")]
 
 
 def test_recent_keeps_the_newest_ten():
@@ -189,9 +207,10 @@ def test_recent_keeps_the_newest_ten():
         failed_at = (datetime(2026, 11, 15, 11, 30, tzinfo=timezone.utc) + timedelta(minutes=i)).isoformat()
         events.append(task(route, "sent", f"第{i}件", sent))
         events.append(task(route, "failed", f"第{i}件", failed_at, error="失败"))
-    recent = derive(events, now=NOW)["recent"]
-    assert len(recent) == 10
-    assert [row["id"] for row in recent] == [f"route-{i:02d}" for i in range(11, 1, -1)]
+    events.append(close())
+    board = derive(events, now=NOW)
+    assert [row["id"] for row in board["waiting"]] == ["route-00"]
+    assert [row["id"] for row in board["recent"]] == [f"route-{i:02d}" for i in range(11, 1, -1)]
 
 
 def test_quarantine_file_is_recent_and_uses_the_original_text_when_the_task_is_known():
@@ -240,6 +259,52 @@ def test_snapshot_reads_the_log_and_quarantine_and_skips_symlinks(tmp_path):
     assert [row["text"] for row in board["running"]] == ["还在跑"]
     assert [row["id"] for row in board["recent"]] == ["quarantine:bad.json"]
     assert board["recent"][0]["text"] == "bad.json"
+
+
+def test_confirmation_readback_waits_while_the_gate_is_on():
+    events = [task("route-1", "awaiting_confirmation", "发邮件给王老师", SENT)]
+    assert derive(events, now=NOW) == {"running": [], "waiting": [], "recent": []}
+    board = derive(events, now=NOW, confirm=True)
+    assert board["running"] == [] and board["recent"] == []
+    row = board["waiting"][0]
+    assert row["status"] == "awaiting_confirmation"
+    assert row["text"] == "发邮件给王老师" and row["target"] == "grok"
+
+
+def test_snapshot_skips_events_older_than_yesterday(tmp_path):
+    now = datetime.now().astimezone().replace(hour=15, minute=0, second=0, microsecond=0)
+    data = tmp_path / "data"
+
+    def one(route, when):
+        append(data, task(route, "sent", route, when.isoformat()))
+
+    one("route-old", now - timedelta(days=3))
+    one("route-yest", now - timedelta(days=1))
+    one("route-today", now - timedelta(hours=1))
+    ids = {row["id"] for row in snapshot(data, now=now)["running"]}
+    assert {"route-today", "route-yest"} <= ids
+    assert "route-old" not in ids
+
+
+def test_tasks_and_the_loop_share_one_read_of_that_window(tmp_path, monkeypatch):
+    import audi27.taskboard as tb
+    from audi27.web import list_loop
+
+    now = datetime.now().astimezone()
+    data = tmp_path / "data"
+    append(data, task("route-1", "running", "还在", now.isoformat()))
+    calls = []
+    real = tb.replay
+
+    def wrapped(*args, **kwargs):
+        calls.append(kwargs.get("since"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tb, "replay", wrapped)
+    assert snapshot(data, now=now)["running"][0]["text"] == "还在"
+    assert snapshot(data, now=now)["running"][0]["text"] == "还在"
+    assert [row["type"] for row in list_loop(data)["events"]] == ["task"]
+    assert len(calls) == 1 and calls[0] is not None
 
 
 def test_dashboard_serves_the_task_section(tmp_path):
