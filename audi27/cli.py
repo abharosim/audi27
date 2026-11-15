@@ -316,11 +316,11 @@ def cmd_queue(args, cfg) -> int:
 
 
 def cmd_speak(args, cfg) -> int:
-    from .speak import serve, speak_text, user_speaking
+    from .speak import serve, speak_text, user_busy
 
     data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
     if args.speak_cmd == "test":
-        result = speak_text(args.text, cfg, speaking=lambda: user_speaking(data_dir))
+        result = speak_text(args.text, cfg, speaking=lambda: user_busy(data_dir, cfg))
         print(f"{result.get('backend', 'log')}: {result.get('text', '')}", flush=True)
         return 0
     _setup_logging(Path(data_dir), args.verbose)

@@ -16,6 +16,7 @@ import numpy as np
 from . import validate as V
 from .config import Config
 from .correct import CorrectionStage
+from .presence import PresencePublisher
 from .segmenter import Segmenter, frame_db
 from .status import write_status
 from .store import Store, _dt, wav_duration
@@ -221,6 +222,10 @@ class Pipeline:
         last_stats = started = time.time()
         last_beat = 0.0
         levels: deque = deque(maxlen=64)  # ~2 s of per-frame loudness for the dashboard waveform
+        # Presence is the fast path (≤0.1 s). The 0.4 s heartbeat below stays the
+        # dashboard's view, and is the speaker's view while [presence] is off.
+        publisher = PresencePublisher(self.store.root, self.cfg.presence) if self.cfg.presence.enabled else None
+        presence_error = False
 
         def beat(stopped: bool = False) -> None:
             try:
@@ -247,6 +252,15 @@ class Pipeline:
                 else:
                     zero_since, warned_zero = None, False
                 s = seg.feed(frame, ts)
+                if publisher is not None:
+                    try:
+                        # Wall clock, not the frame timestamp: the speaker compares
+                        # `updated` with time.time(), and a frame ts can sit ahead of it.
+                        publisher.tick(bool(seg.last_speech))
+                    except Exception:
+                        if not presence_error:
+                            log.exception("presence update failed")
+                            presence_error = True
                 if s is not None:
                     self.q.put((self.store.spool_wav(s), 0))
                 # map -60..-10 dBFS to 0..1
@@ -264,6 +278,11 @@ class Pipeline:
             log.info("stopping")
         finally:
             self.stop.set()
+            if publisher is not None:
+                try:
+                    publisher.close()
+                except Exception:
+                    log.exception("presence was not closed")
             s = seg.flush()
             if s is not None:
                 self.q.put((self.store.spool_wav(s), 0))

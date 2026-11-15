@@ -131,6 +131,21 @@ summary_chars = 80
 enabled = false
 voice = "Tingting"
 
+# Fast "is the user talking" signal. Default off: the speaker keeps using the
+# status.json heartbeat (about 0.4 s). On: the recorder writes data/presence.json
+# from the energy VAD it already runs, and appends a presence event only when
+# the debounced state changes. The speaker will not start during speech or for
+# grace_s after it ends, and kills `say` when speech starts. A stale or
+# future-dated file does not block. No extra process; start.sh wires nothing
+# unless this flag is on.
+[presence]
+enabled = false
+publish_s = 0.1       # refresh the file at least this often; also on every change. <= 0.2
+stale_s = 1.0         # older than this (or timestamped ahead of now) is unknown
+onset_ms = 60         # continuous speech before "speaking" (max 200, so the file is in time)
+hangover_ms = 400     # continuous silence before "quiet"; shorter gaps do not flap
+grace_s = 0.3         # after quiet, wait this long before the speaker starts
+
 [store]
 data_dir = "data"
 # "all" | "suspect" (only suspect+rejected) | "none". Replay/eval and playback need the audio:
