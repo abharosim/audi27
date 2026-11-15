@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .cue import playback_windows
 from .events import append, make_event, read_new, replay, snapshot_offsets
 from .turns import DEFAULT_TRIGGERS, _strip_trigger, match_trigger
 
@@ -278,16 +279,24 @@ def _choose(answer: Answer, ready: list):
     return max(ready, key=lambda pair: (pair[0], pair[1]["ts"], pair[1]["id"]))[1]
 
 
-def overlaps_playback(start: datetime, briefs: dict, spoken_at: dict) -> bool:
-    """True when `start` is during a confirm read-back, or within `ECHO_GRACE_S` after it.
+def overlaps_playback(start: datetime, briefs: dict, spoken_at: dict, cues=None) -> bool:
+    """True when `start` is our own audio: a confirm read-back, or a wake cue.
 
     `briefs` maps a task id to `(read-back time, brief id)` pairs. `spoken_at`
     maps a brief id to the time `say` finished. A bare line in that span is the
-    speaker's own audio, not a person approving. No `spoken` event means nothing
-    was played, so this returns false.
+    speaker's own audio, not a person approving. No `spoken` event means the
+    read-back check is false. `cues` is `(begin, end)` windows from
+    `playback_windows`: a successful `cue_played` covers the same case for the
+    ding. A wake-word turn is not passed here; talking over the ding still counts.
     """
     if not isinstance(start, datetime):
         return False
+    for window in cues or ():
+        if not isinstance(window, tuple) or len(window) != 2:
+            continue
+        begin, end = window
+        if isinstance(begin, datetime) and isinstance(end, datetime) and begin <= start < end:
+            return True
     grace = timedelta(seconds=ECHO_GRACE_S)
     for rows in briefs.values():
         for when, brief_id in rows:
@@ -307,6 +316,8 @@ def plan(events, *, window_s: float = 20.0, triggers=None) -> list[dict]:
     to fall inside `window_s` of the latest read-back; a 达达 turn does not.
     """
     triggers = tuple(triggers) if triggers else DEFAULT_TRIGGERS
+    events = list(events)
+    cues = playback_windows(events)
     tasks: dict[str, dict] = {}
     briefs: dict[str, list] = {}
     spoken_at: dict[str, datetime] = {}
@@ -368,7 +379,7 @@ def plan(events, *, window_s: float = 20.0, triggers=None) -> list[dict]:
             continue
         # The mic hears the read-back. A bare "确认" during playback, or in the
         # short tail after `say` returns, is the speaker, not an approval.
-        if kind == "bare" and overlaps_playback(start, briefs, spoken_at):
+        if kind == "bare" and overlaps_playback(start, briefs, spoken_at, cues):
             continue
         ready = []
         for task in tasks.values():

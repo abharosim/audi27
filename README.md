@@ -47,6 +47,8 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 confirm run` | 跟事件流，把确认或取消写成 `confirm`（`[confirm]` 关着就不写） |
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
+| `audi27 cue test` | 响一声唤醒提示音，不写事件；没有 `afplay` 就打印 |
+| `audi27 cue run` | 跟着 turn，一检测到唤醒词就播放一声短提示 |
 | `audi27 screen run` | 记录最前面的应用和窗口标题（默认关，仅 macOS 真正采样） |
 | `audi27 grokbot test "文本"` | 向 Grok Bot webhook 发一条测试 POST，打印 HTTP 状态码 |
 | `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
@@ -56,7 +58,7 @@ uv run pytest                        # 不需要麦克风和模型
 
 ## 事件流
 
-模块之间只追加写入 `data/events/YYYY-MM-DD.jsonl`（本地日期，一行一个 JSON）。固定字段：`id`、`ts`（带时区）、`type`、`source`、`ref`（引起它的事件，没有则为 null）、`data`。已知类型：`utterance`、`screen`、`presence`、`turn`、`route`、`task`、`reply`、`brief`、`spoken`、`confirm`。不认识的类型也会原样保存，读的时候不要拒绝。
+模块之间只追加写入 `data/events/YYYY-MM-DD.jsonl`（本地日期，一行一个 JSON）。固定字段：`id`、`ts`（带时区）、`type`、`source`、`ref`（引起它的事件，没有则为 null）、`data`。已知类型：`utterance`、`screen`、`presence`、`turn`、`route`、`task`、`reply`、`brief`、`spoken`、`confirm`、`cue_played`。不认识的类型也会原样保存，读的时候不要拒绝。
 
 ```bash
 uv run audi27 events replay --since 2h --type utterance
@@ -86,6 +88,25 @@ uv run audi27 turns run                           # 常驻写 turn
 ```
 
 `config.toml` 里 `[turns] enabled = true` 时，`./start.sh`（`audi27 supervise`）会把 `turns run` 和录音、仪表盘一起拉起来。默认关着。
+
+## 唤醒提示音
+
+检测到一轮唤醒词（`turn` 刚写出来、路由和分派还没动手）时，`cue` 在本机响一声短提示。默认关，和其它常驻开关一样。要听到，在自己的 `config.toml` 里加上（从旧的 `config.example.toml` 抄来的文件没有这一节，缺了就保持安静）：
+
+```toml
+[cue]
+enabled = true
+sound = "/System/Library/Sounds/Tink.aiff"   # 可省略，这是默认值
+```
+
+同时把 `[turns] enabled` 打开，否则没有 turn 可应答。`./start.sh` 会拉起 `audi27 cue run`。macOS 用 `afplay` 播放，最长 1 秒，不等它播完，所以不会拖住转写。文件不存在、没有 `afplay`、或者不是 macOS，只记一条日志，进程不退出。每条新 turn 追加一条 `cue_played`（`ref` 指向那条 turn）。第一次启动不补历史。`audi27 cue test` 只响一声，不写事件。
+
+提示音很短。麦克风如果把这一声听成没有触发词的「确认 / 好的 / ok」，确认门会把它当成自己的回声丢掉，和念读回时的处理一样。带「达达」的一轮仍然算数。`ok` 为 false 的记录表示没响成，不会吞掉后面的回答。
+
+```bash
+uv run audi27 cue test
+uv run audi27 cue run
+```
 
 ## 意图路由
 
@@ -180,7 +201,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[confirm]`、`[screen]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[confirm]`、`[screen]`、`[cue]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
 
 改完代码后重启，不需要碰那个终端：
 

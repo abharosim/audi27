@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .agent import Agent, build_agent, task_event
 from .confirm import classify_answer, overlaps_playback
+from .cue import playback_windows
 from .events import append, make_event, read_new, replay, snapshot_offsets
 from .route import AGENT_TARGETS
 
@@ -247,6 +248,7 @@ def _index(data_dir):
     """Routes, held tasks, read-backs, spoken ends, and confirm events in the log."""
     routes, tasks, briefs, origins, confirms = {}, {}, {}, {}, []
     spoken_at: dict[str, datetime] = {}
+    cue_events = []
     for ev in replay(data_dir):
         if isinstance(ev.get("id"), str):
             origins[ev["id"]] = ev
@@ -272,8 +274,10 @@ def _index(data_dir):
                     spoken_at[ev["ref"]] = when
         elif kind == "confirm":
             confirms.append(ev)
+        elif kind == "cue_played":
+            cue_events.append(ev)
     confirms.sort(key=_confirm_key)
-    return routes, tasks, briefs, origins, confirms, spoken_at
+    return routes, tasks, briefs, origins, confirms, spoken_at, playback_windows(cue_events)
 
 
 def _expire(tasks, routes, state, emit, now, cfg) -> None:
@@ -291,12 +295,12 @@ def _expire(tasks, routes, state, emit, now, cfg) -> None:
         emit(task_event(route, status="expired", ref=info["id"], adapter=None, ts=now))
 
 
-def _effective(ev, task_id, briefs, origins, spoken_at):
+def _effective(ev, task_id, briefs, origins, spoken_at, cues):
     """(counts, answer time). A voice answer before the read-back does not count.
 
-    A bare utterance that overlaps the read-back playback does not count either:
-    that is the speaker coming back through the microphone. The caller also
-    drops an answer timestamped before the task itself existed.
+    A bare utterance that overlaps the read-back, or a wake-cue window, does not
+    count either: that is this machine coming back through the microphone. The
+    caller also drops an answer timestamped before the task itself existed.
     """
     data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
     source = data.get("source")
@@ -313,7 +317,7 @@ def _effective(ev, task_id, briefs, origins, spoken_at):
     times = [when for when, _bid in (briefs.get(task_id) or [])]
     if not times or answer < min(times):
         return False, answer
-    if origin.get("type") == "utterance" and overlaps_playback(answer, briefs, spoken_at):
+    if origin.get("type") == "utterance" and overlaps_playback(answer, briefs, spoken_at, cues):
         return False, answer
     return True, answer
 
@@ -329,7 +333,7 @@ def _note_expired(ev, task_id, emit) -> None:
     }, ts=ev.get("ts"), ref=ev.get("id"), id=f"brief-expired-{ev.get('id')}"))
 
 
-def _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, state, cfg, emit, agents, data_dir) -> None:
+def _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, cues, state, cfg, emit, agents, data_dir) -> None:
     data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
     decision = data.get("decision")
     task_id = data.get("task_id")
@@ -342,7 +346,7 @@ def _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, state, cfg, em
     if route is None:
         return
     route_id = info["route_id"]
-    ok, answer_time = _effective(ev, task_id, briefs, origins, spoken_at)
+    ok, answer_time = _effective(ev, task_id, briefs, origins, spoken_at, cues)
     if not ok or answer_time is None:
         return
     started = _parse_ts(info["ts"])
@@ -372,11 +376,11 @@ def settle(data_dir, cfg, emit, state, agents, now) -> None:
     """
     if not cfg.confirm.enabled:
         return
-    routes, tasks, briefs, origins, confirms, spoken_at = _index(data_dir)
+    routes, tasks, briefs, origins, confirms, spoken_at, cues = _index(data_dir)
     for ev in confirms:
         when = _parse_ts(ev.get("ts")) or now
         _expire(tasks, routes, state, emit, when, cfg)
-        _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, state, cfg, emit, agents, data_dir)
+        _apply_confirm(ev, tasks, routes, briefs, origins, spoken_at, cues, state, cfg, emit, agents, data_dir)
     _expire(tasks, routes, state, emit, now, cfg)
 
 
