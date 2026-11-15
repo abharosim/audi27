@@ -6,6 +6,7 @@ when the request comes from another origin, so a web page you happen to visit ca
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import queue
@@ -72,6 +73,33 @@ class Jobs:
             except Exception as e:  # keep the job thread alive whatever a backend does
                 log.exception("replay run crashed")
                 self._update(running=False, done=True, error=repr(e))
+
+
+def _media_type(value: str | None) -> str:
+    """The content type without parameters. `text/plain;charset=application/json` is `text/plain`."""
+    if not value:
+        return ""
+    return value.split(";", 1)[0].strip().lower()
+
+
+def _loopback_host(value: str | None) -> bool:
+    """True when this host is loopback, not a wildcard and not a rebound name."""
+    if not value:
+        return False
+    host = value.strip().lower().rstrip(".")
+    if host.startswith("["):
+        end = host.find("]")
+        name = host[1:end] if end > 1 else ""
+    elif host.count(":") == 1:
+        name = host.split(":", 1)[0]
+    else:
+        name = host
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 
 def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
@@ -168,7 +196,9 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                     limit = int(q.get("limit", 200))
                     if limit < 1 or limit > 1000:
                         raise ValueError("limit must be 1..1000")
-                    self._json(list_loop(root, limit=limit))
+                    payload = list_loop(root, limit=limit)
+                    payload["confirm"] = bool(load_cfg().confirm.enabled)
+                    self._json(payload)
                 elif url.path.startswith("/audio/"):
                     self._audio(unquote(url.path[len("/audio/"):]))
                 else:
@@ -185,7 +215,9 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                 origin = self.headers.get("Origin")
                 if origin and urlparse(origin).netloc != self.headers.get("Host"):
                     return self._json({"error": "cross-origin request refused"}, 403)
-                if "application/json" not in (self.headers.get("Content-Type") or ""):
+                # The media type itself, not a parameter that happens to contain the
+                # letters "application/json". A form post cannot set this type.
+                if _media_type(self.headers.get("Content-Type")) != "application/json":
                     return self._json({"error": "send JSON"}, 415)
                 length = int(self.headers.get("Content-Length") or 0)
                 if length > 1_000_000:
@@ -216,6 +248,25 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                         raise ValueError("correct must be true or false")
                     else:
                         self._json(save_route_verdict(root, route_id, correct=body["correct"]))
+                elif path == "/api/confirm":
+                    # The listening socket has to be loopback, not only the Host
+                    # header: a client can claim Host 127.0.0.1 on a wildcard bind.
+                    # A page on another name that rebinds to 127.0.0.1 sends that
+                    # name as Host, and Origin would match it.
+                    bound = self.server.server_address[0] if self.server is not None else ""
+                    if not _loopback_host(self.headers.get("Host")) or not _loopback_host(str(bound)):
+                        return self._json({"error": "confirm is only accepted from localhost"}, 403)
+                    site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+                    if site and site not in ("same-origin", "none"):
+                        return self._json({"error": "cross-origin request refused"}, 403)
+                    if not load_cfg().confirm.enabled:
+                        return self._json({"error": "confirm gate is off"}, 403)
+                    task_id = body.get("task_id")
+                    decision = body.get("decision")
+                    if not isinstance(task_id, str) or not isinstance(decision, str):
+                        raise ValueError("task_id and decision must be strings")
+                    from .confirm import record_decision
+                    self._json(record_decision(root, task_id, decision))
                 else:
                     self._json({"error": "not found"}, 404)
             except (ValueError, C.ConfigError) as e:
@@ -246,10 +297,10 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
 
 
 def list_loop(root, *, limit: int = 200) -> dict:
-    """Recent task / reply / brief / spoken events, newest first. Read-only."""
+    """Recent task / reply / brief / spoken / confirm events, newest first. Read-only."""
     rows = []
     for ev in replay(root):
-        if ev.get("type") not in ("task", "reply", "brief", "spoken"):
+        if ev.get("type") not in ("task", "reply", "brief", "spoken", "confirm"):
             continue
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         if ev["type"] == "task":
@@ -259,15 +310,20 @@ def list_loop(root, *, limit: int = 200) -> dict:
             summary = data.get("text") or ""
         elif ev["type"] == "brief":
             summary = f"[{data.get('priority') or ''}] {data.get('summary') or ''}"
+        elif ev["type"] == "confirm":
+            summary = " ".join(str(x) for x in (data.get("decision"), data.get("task_id")) if x)
         else:
             flag = "interrupted" if data.get("interrupted") else "completed" if data.get("completed") else ""
             summary = " ".join(x for x in (flag, data.get("text") or "") if x)
         text = " ".join(str(summary).split())
         if len(text) > 240:
             text = text[:239] + "…"
+        task_id = ev["id"] if ev["type"] == "task" else data.get("task_id")
         rows.append({
             "id": ev["id"], "ts": ev.get("ts"), "type": ev["type"],
             "ref": ev.get("ref"), "summary": text,
+            "status": data.get("status") if ev["type"] == "task" else None,
+            "task_id": task_id if isinstance(task_id, str) else None,
         })
     if limit > 0:
         rows = rows[-limit:]
