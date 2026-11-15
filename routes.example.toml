@@ -11,7 +11,8 @@
 # Claude Code and the local model are not keyword targets. They are used only
 # when a name in [agents] matches, including the ASR spellings from context.md
 # (Cloud Code, Crowed Code, grog, …). A name match allows spaces to be missing,
-# so "cloudcode" still matches "cloud code".
+# so "cloudcode" still matches "cloud code". A name that is explicitly negated
+# (别用 / 不要用 / don't use, immediately before the name) is not selected.
 
 default = "grok"
 

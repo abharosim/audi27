@@ -142,9 +142,11 @@
   </div>
 
   <section id="viewR" hidden>
-    <p class="hint">只显示，不发给任何 agent。点 ✓ / ✗ 标记这条路由对不对，用来看误分派。</p>
+    <p class="hint">路由只显示。点 ✓ / ✗ 标记这条路由对不对，用来看误分派。下面是分派之后的 task / reply / brief / spoken，有进程在写才会出现。</p>
     <div class="bar"><span class="count" id="routeInfo"></span></div>
     <div id="routeList"></div>
+    <h2 class="count">回路</h2>
+    <div id="loopList"></div>
   </section>
 
   <section id="viewE" hidden>
@@ -570,10 +572,11 @@ async function loadRoutes(force) {
   const accText = acc.judged ? `准确率 ${(acc.rate * 100).toFixed(1)}%（${acc.correct}/${acc.judged}）` : '还没有判定';
   const sig = accText + '|' + rows.map(r => r.id + ':' + r.verdict + ':' + r.target).join(',');
   $('routeInfo').textContent = `${rows.length} 条 · ${accText}`;
-  if (!force && sig === routeSig) return;
+  if (!force && sig === routeSig) { loadLoop(); return; }
   routeSig = sig;
   const list = $('routeList');
   list.replaceChildren();
+  loadLoop();
   if (!rows.length) {
     list.append(el('div', 'empty', '还没有路由。对达达说一句，turns 和 route 写进事件流后会出现在这里。'));
     return;
@@ -605,6 +608,28 @@ async function loadRoutes(force) {
     table.append(tr);
   }
   list.append(table);
+}
+async function loadLoop() {
+  const box = $('loopList');
+  if (!box) return;
+  let d;
+  try { d = await getJSON('/api/loop'); } catch (e) { return; }
+  if (d.error) { box.textContent = d.error; return; }
+  const rows = d.events || [];
+  box.replaceChildren();
+  if (!rows.length) {
+    box.append(el('div', 'empty', '还没有 task / reply / brief / spoken。'));
+    return;
+  }
+  const table = el('table', 'routes'), head = el('tr');
+  ['时间', '类型', '内容'].forEach(t => head.append(el('th', '', t)));
+  table.append(head);
+  for (const r of rows) {
+    const tr = el('tr');
+    tr.append(el('td', 'when', routeWhen(r.ts)), el('td', '', r.type || ''), el('td', 'turn', r.summary || ''));
+    table.append(tr);
+  }
+  box.append(table);
 }
 setInterval(() => loadRoutes(false), 3000);
 

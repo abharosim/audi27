@@ -81,6 +81,37 @@ class RouteCfg:
 
 
 @dataclass
+class DispatchCfg:
+    # `audi27 supervise` starts `dispatch run` only when this is true. Default off:
+    # routes stay display-only until execution is turned on. `dispatch run` itself
+    # always dispatches.
+    enabled: bool = False
+    # target -> adapter name. Missing targets use "fake".
+    adapters: dict = field(default_factory=dict)
+
+
+@dataclass
+class FakeCfg:
+    delay_s: float = 0.0
+    fail_marker: str = "模拟失败"       # route text containing this makes the fake agent fail
+    decision_marker: str = "需要你决定"  # route text containing this asks for a decision
+
+
+@dataclass
+class QueueCfg:
+    # `audi27 supervise` starts `queue run` only when this is true. `queue run` ignores it.
+    enabled: bool = False
+    summary_chars: int = 80
+
+
+@dataclass
+class SpeakCfg:
+    # `audi27 supervise` starts `speak run` only when this is true. `speak run` ignores it.
+    enabled: bool = False
+    voice: str = "Tingting"  # macOS zh_CN. Older systems call this voice Ting-Ting.
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -101,6 +132,10 @@ class Config:
     correct: CorrectCfg = field(default_factory=CorrectCfg)
     turns: TurnsCfg = field(default_factory=TurnsCfg)
     route: RouteCfg = field(default_factory=RouteCfg)
+    dispatch: DispatchCfg = field(default_factory=DispatchCfg)
+    fake: FakeCfg = field(default_factory=FakeCfg)
+    queue: QueueCfg = field(default_factory=QueueCfg)
+    speak: SpeakCfg = field(default_factory=SpeakCfg)
     backend: dict = field(default_factory=dict)  # name -> constructor kwargs
     corrector: dict = field(default_factory=dict)  # name -> constructor kwargs
 
@@ -118,8 +153,7 @@ def load(path: str | Path | None = None) -> Config:
     if path is None:
         path = Path("config.toml")
         if not path.exists():
-            _check_turns(cfg)
-            _check_route(cfg)
+            _check_all(cfg)
             return cfg
     path = Path(path)
     try:
@@ -143,8 +177,7 @@ def load(path: str | Path | None = None) -> Config:
     cfg.transcribe.languages = [x.lower() for x in langs]
     if not cfg.transcribe.backends:
         raise ConfigError("transcribe.backends is empty")
-    _check_turns(cfg)
-    _check_route(cfg)
+    _check_all(cfg)
     return cfg
 
 
@@ -167,6 +200,15 @@ def _check_turns(cfg: Config) -> None:
         raise ConfigError("turns.max_duration_s must be > 0")
 
 
+def _check_all(cfg: Config) -> None:
+    _check_turns(cfg)
+    _check_route(cfg)
+    _check_dispatch(cfg)
+    _check_fake(cfg)
+    _check_queue(cfg)
+    _check_speak(cfg)
+
+
 def _check_route(cfg: Config) -> None:
     r = cfg.route
     if not isinstance(r.enabled, bool):
@@ -181,6 +223,58 @@ def _check_route(cfg: Config) -> None:
     r.timeout_s = float(r.timeout_s)
     if r.timeout_s <= 0:
         raise ConfigError("route.timeout_s must be > 0")
+
+
+_DISPATCH_TARGETS = ("grok", "muse", "claude_code", "local")
+
+
+def _check_dispatch(cfg: Config) -> None:
+    d = cfg.dispatch
+    if not isinstance(d.enabled, bool):
+        raise ConfigError("dispatch.enabled must be true or false")
+    if not isinstance(d.adapters, dict):
+        raise ConfigError("dispatch.adapters must be a table of target = \"fake\"")
+    cleaned = {}
+    for key, value in d.adapters.items():
+        if key not in _DISPATCH_TARGETS:
+            raise ConfigError(f"dispatch.adapters.{key} is not a target ({', '.join(_DISPATCH_TARGETS)})")
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"dispatch.adapters.{key} must be an adapter name")
+        cleaned[key] = value.strip()
+    d.adapters = cleaned
+
+
+def _check_fake(cfg: Config) -> None:
+    f = cfg.fake
+    if isinstance(f.delay_s, bool) or not isinstance(f.delay_s, (int, float)):
+        raise ConfigError("fake.delay_s must be a number")
+    f.delay_s = float(f.delay_s)
+    if f.delay_s < 0:
+        raise ConfigError("fake.delay_s must be >= 0")
+    for name in ("fail_marker", "decision_marker"):
+        value = getattr(f, name)
+        if not isinstance(value, str):
+            raise ConfigError(f"fake.{name} must be a string")
+        setattr(f, name, value.strip())
+
+
+def _check_queue(cfg: Config) -> None:
+    q = cfg.queue
+    if not isinstance(q.enabled, bool):
+        raise ConfigError("queue.enabled must be true or false")
+    if isinstance(q.summary_chars, bool) or not isinstance(q.summary_chars, int):
+        raise ConfigError("queue.summary_chars must be an integer")
+    if q.summary_chars < 1:
+        raise ConfigError("queue.summary_chars must be >= 1")
+
+
+def _check_speak(cfg: Config) -> None:
+    s = cfg.speak
+    if not isinstance(s.enabled, bool):
+        raise ConfigError("speak.enabled must be true or false")
+    if not isinstance(s.voice, str) or not s.voice.strip():
+        raise ConfigError("speak.voice must be a voice name, e.g. Tingting")
+    s.voice = s.voice.strip()
 
 
 _FROM_DOTENV: set = set()

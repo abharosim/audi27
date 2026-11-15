@@ -38,6 +38,19 @@ CASES = [
     ("CLOUD CODE 看一下", "claude_code", None, False, "rule"),
     ("cloudcode跑一下", "claude_code", None, False, "rule"),
     ("让 Claude 看一下", "grok", None, False, "default"),
+    ("别用 Claude Code", "grok", None, False, "default"),
+    ("不要用 Claude Code", "grok", None, False, "default"),
+    ("请不要用 Claude Code 修一下", "grok", None, False, "default"),
+    ("don't use Claude Code", "grok", None, False, "default"),
+    ("Don't use Claude Code", "grok", None, False, "default"),
+    ("do not use Claude Code", "grok", None, False, "default"),
+    ("别用 Claude Code，问一下 Muse", "muse", None, False, "rule"),
+    ("不要用 Claude Code，用 Muse", "muse", None, False, "rule"),
+    ("别用 Claude Code，用 Grok", "grok", None, False, "rule"),
+    ("别用 Claude Code，用 Grok 查天气", "grok", None, False, "rule"),
+    ("don't use Claude Code, ask Muse", "muse", None, False, "rule"),
+    ("别用 Grok 查一下", "none", None, False, "rule"),
+    ("不要用 Muse 看看面试", "none", None, False, "rule"),
     ("fix the code", "grok", None, False, "default"),
     ("用本地模型总结一下", "local", None, False, "rule"),
     ("用 local model 总结一下这段", "local", None, False, "rule"),
@@ -192,6 +205,18 @@ def test_address_strip_keeps_words_that_only_end_in_qing():
     assert kept.target == "claude_code"
     assert kept.text == "请求发给 Claude Code 修一下"
     assert decide("请用本地模型总结一下", RULES).text == "总结一下"
+
+
+def test_a_negated_agent_name_is_not_selected():
+    blocked = decide("别用 Grok 查一下", RULES)
+    assert blocked.target == "none" and blocked.rule == "negated:grok"
+    career = decide("不要用 Muse 看看面试", RULES)
+    assert career.target == "none" and career.rule == "negated:muse"
+    kept = decide("别用 Claude Code，问一下 Muse 面试怎么准备", RULES)
+    assert kept.target == "muse" and kept.rule == "explicit:muse"
+    # The positive spelling still wins, including the ASR forms.
+    assert decide("用 Claude Code 看看", RULES).target == "claude_code"
+    assert decide("别用cloud code，问一下 Grok", RULES).target == "grok"
 
 
 def test_explicit_name_is_the_rule_even_when_a_keyword_also_matches():

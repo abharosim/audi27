@@ -41,6 +41,11 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 route run` | 跟着 turn，写成 `route`（只显示，不发给 agent） |
 | `audi27 route replay --since today` | 用历史 turn 重算 route，默认只打印 |
 | `audi27 route test "一句话"` | 看这一句会分给谁 |
+| `audi27 dispatch run` | 把 route 交给适配器，写出 `task` / `reply`（默认关） |
+| `audi27 queue run` | 跟着回复，按优先级写 `brief` |
+| `audi27 queue show` | 用事件流重算队列，只打印 |
+| `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
+| `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
 | `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
@@ -82,7 +87,7 @@ uv run audi27 turns run                           # 常驻写 turn
 
 `route` 只读 `turn`，每条写一个 `route`（`id` 为 `route-<turn id>`，`ref` 指向那条 turn）。它不给任何 agent 发消息。仪表盘「路由」页列出最近的结果，✓ / ✗ 记在 `data/route_verdicts.jsonl`，并显示累计准确率。
 
-规则在 `routes.toml`（不存在就用仓库里的 `routes.example.toml`），每条 turn 重新读，改完保存下一条就生效。顺序是：句中点名的 agent（含 Cloud Code、Crowed Code、grog 这类听写）优先，然后整句的队列指令（详细说说 / 跳过 / 稍后 / 还有什么没处理 / 关掉），然后不像指令的整句（算了、不用了），然后关键词（职业规划一类给 Muse），剩下默认 Grok。Claude Code 和本地模型只有被点名才用。`[route] llm = true` 时，没撞上规则的句子才交给纠错用的那个本地模型，超时或答非所问就退回默认；测试可以注入一个假分类器，不需要模型。像发邮件、付款、删除、push、发帖这种句子会标 `needs_confirmation`。
+规则在 `routes.toml`（不存在就用仓库里的 `routes.example.toml`），每条 turn 重新读，改完保存下一条就生效。顺序是：句中点名的 agent（含 Cloud Code、Crowed Code、grog 这类听写）优先，然后整句的队列指令（详细说说 / 跳过 / 稍后 / 还有什么没处理 / 关掉），然后不像指令的整句（算了、不用了），然后关键词（职业规划一类给 Muse），剩下默认 Grok。名字紧挨着「别用 / 不要用 / don't use」时不当成点名；如果因此落到的目标正是被排除的那个（比如「别用 Grok」），结果是不分派。Claude Code 和本地模型只有被点名才用。`[route] llm = true` 时，没撞上规则的句子才交给纠错用的那个本地模型，超时或答非所问就退回默认；测试可以注入一个假分类器，不需要模型。像发邮件、付款、删除、push、发帖这种句子会标 `needs_confirmation`。
 
 ```bash
 uv run audi27 route test "帮我问一下 Muse 下个月面试怎么准备"
@@ -92,6 +97,16 @@ uv run audi27 route run                           # 常驻写 route
 ```
 
 `[route] enabled = true` 时 `./start.sh` 会把 `route run` 也拉起来。默认关着。要有 turn 才有 route，所以一起开 `[turns] enabled`。
+
+## 分派、队列、播报
+
+这三步把回路接上，但默认都不执行。`[dispatch] enabled`、`[queue] enabled`、`[speak] enabled` 都是 `false`，`./start.sh` 不会拉起它们。路由继续只显示。要跑的时候再开，或者手动执行下面的命令。
+
+- **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器；口头确认留到后面。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器（Claude Code、Grok、Muse、本地模型）以后按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
+- **队列** `audi27 queue run` 把 `reply` 和失败的 `task` 收成 `brief`。优先级是 decision > error > done > info。一次只放出一条，等 `spoken` 之后才放下一条；已经在念的不会被后来的更高优先级打断。摘要是第一句，超长截断；`summarize_fn` 是以后接模型的钩子，现在不调用。队列指令（target `queue`）：详细说说念全文，跳过丢掉当前条，稍后放到队尾，还有什么列剩下的，关掉清空。状态靠重放事件恢复，不另存一份。`audi27 queue show` 重放整段日志并打印，不写 brief。`queue run` 第一次启动不汇报历史，重启从那次的位置重放。
+- **播报** `audi27 speak run` 按 brief 的顺序调用 macOS `say`（`[speak] voice`，默认 `Tingting`）。写出 `spoken`：念了什么、是否念完、是否被打断。录音心跳 `data/status.json` 的 `speaking` 为真时不开始；念到一半变成真就停掉 `say`。心跳大约 0.4 秒写一次，所以停下来比设计里的 0.2 秒慢，要更快得改采集端。没有 `say`（比如 Linux 上的测试）就记一条日志，进程不退出。`say` 报不出念到第几个字，`text` 是交给它的整句。`audi27 speak test "文字"` 只试这一句，不写事件。第一次启动不补历史。
+
+`spoken` 的 `ref` 指回 brief，再往前是 reply、task、route、turn、utterance。仪表盘「路由」页下面多一块「回路」，列出 task / reply / brief / spoken。
 
 ## 换转写后端
 
@@ -157,7 +172,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。
 
 改完代码后重启，不需要碰那个终端：
 
