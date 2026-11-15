@@ -326,8 +326,34 @@ def _check_speak(cfg: Config) -> None:
 _FROM_DOTENV: set = set()
 
 
+def _dotenv_value(raw: str) -> str:
+    """Value of one .env assignment. Quotes and a trailing ` # comment` are not part of it."""
+    value = raw.strip()
+    if value[:1] in "\"'":
+        quote = value[0]
+        i = 1
+        while i < len(value):
+            if value[i] == "\\" and i + 1 < len(value):
+                i += 2
+                continue
+            if value[i] == quote:
+                rest = value[i + 1:].strip()
+                if rest == "" or rest.startswith("#"):
+                    return value[1:i]
+                break
+            i += 1
+        return value
+    cut = value.find(" #")
+    if cut != -1:
+        value = value[:cut].rstrip()
+    return value
+
+
 def load_dotenv(path: Path = Path(".env")) -> None:
-    """KEY=VALUE lines from ./.env into the environment (existing variables win). Keeps API keys out of config.toml."""
+    """KEY=VALUE lines from ./.env into the environment (existing variables win). Keeps API keys out of config.toml.
+
+    A missing file is ignored. `#` comments and optional quotes are stripped; the real environment wins.
+    """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -339,10 +365,8 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
         key = key.strip()
+        value = _dotenv_value(value)
         if key not in os.environ or key in _FROM_DOTENV:  # real environment wins; .env edits are picked up
             os.environ[key] = value
             _FROM_DOTENV.add(key)
