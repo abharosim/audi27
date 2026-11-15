@@ -396,10 +396,27 @@ def turn_id(turn: Turn) -> str:
     return "turn-" + turn.utterance_ids[0]
 
 
-def turn_event(turn: Turn) -> dict:
-    """One `turn` event. The id is fixed from the first utterance, so a replay can be repeated."""
-    return make_event("turn", TURN_SOURCE, turn.data(), ts=turn.end,
+def turn_event(turn: Turn, *, screen: dict | None = None) -> dict:
+    """One `turn` event. The id is fixed from the first utterance, so a replay can be repeated.
+
+    `screen` is the public app/title snapshot. Omit it, and the event matches a
+    turn written with screen context off.
+    """
+    data = turn.data()
+    if screen:
+        data["screen"] = screen
+    return make_event("turn", TURN_SOURCE, data, ts=turn.end,
                       ref=turn.utterance_ids[0], id=turn_id(turn))
+
+
+def event_for_turn(data_dir, cfg, turn: Turn) -> dict:
+    """The turn event, plus screen context when `[screen] enabled` and a snapshot is in window."""
+    screen = None
+    if cfg is not None and getattr(getattr(cfg, "screen", None), "enabled", False):
+        from .screen import context_for
+
+        screen = context_for(data_dir, cfg, turn.end)
+    return turn_event(turn, screen=screen)
 
 
 def format_turn(turn: Turn) -> str:
@@ -455,11 +472,14 @@ def assemble_replay(data_dir, cfg, *, since=None, until=None) -> tuple[list[Turn
     return turns, stats
 
 
-def write_turns(data_dir, turns) -> dict:
-    """Append turn events. An id already in that day's file is skipped."""
+def write_turns(data_dir, turns, cfg=None) -> dict:
+    """Append turn events. An id already in that day's file is skipped.
+
+    Pass `cfg` so an enabled screen sampler's latest snapshot is stored on the turn.
+    """
     wrote = skipped = 0
     for turn in turns:
-        stored = append(data_dir, turn_event(turn), if_absent=True)
+        stored = append(data_dir, event_for_turn(data_dir, cfg, turn), if_absent=True)
         if stored is None:
             skipped += 1
         else:
@@ -467,11 +487,18 @@ def write_turns(data_dir, turns) -> dict:
     return {"wrote": wrote, "skipped": skipped}
 
 
-def write_turn_file(path, turns) -> None:
+def write_turn_file(path, turns, data_dir=None, cfg=None) -> None:
     """Replace `path` with the turn events as JSON lines. A second run writes the same bytes."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(json.dumps(turn_event(t), ensure_ascii=False) + "\n" for t in turns)
+    lines = []
+    for turn in turns:
+        if cfg is not None and data_dir is not None:
+            event = event_for_turn(data_dir, cfg, turn)
+        else:
+            event = turn_event(turn)
+        lines.append(json.dumps(event, ensure_ascii=False) + "\n")
+    payload = "".join(lines)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     os.replace(tmp, path)
@@ -514,10 +541,10 @@ def _load_cursor(data_dir) -> dict[str, int]:
     return offsets
 
 
-def _emit(data_dir, turn: Turn) -> bool:
+def _emit(data_dir, turn: Turn, cfg=None) -> bool:
     """Append the turn. False only when the write failed; an id already stored is success."""
     try:
-        stored = append(data_dir, turn_event(turn), if_absent=True)
+        stored = append(data_dir, event_for_turn(data_dir, cfg, turn), if_absent=True)
     except Exception:
         log.exception("turn event was not written for %s", turn.utterance_ids[0])
         return False
@@ -564,7 +591,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
         try:
             for ev in ordered:
                 for turn in asm.push(ev):
-                    ok = _emit(data_dir, turn) and ok
+                    ok = _emit(data_dir, turn, cfg) and ok
             if closing:
                 closed = asm.finish()
             elif stamp is not None:
@@ -572,7 +599,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
             else:
                 closed = []
             for turn in closed:
-                ok = _emit(data_dir, turn) and ok
+                ok = _emit(data_dir, turn, cfg) and ok
         finally:
             asm._clock = previous
         return ok

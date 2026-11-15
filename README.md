@@ -47,6 +47,7 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 confirm run` | 跟事件流，把确认或取消写成 `confirm`（`[confirm]` 关着就不写） |
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
+| `audi27 screen run` | 记录最前面的应用和窗口标题（默认关，仅 macOS 真正采样） |
 | `audi27 grokbot test "文本"` | 向 Grok Bot webhook 发一条测试 POST，打印 HTTP 状态码 |
 | `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
@@ -179,7 +180,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[confirm]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]`、`[confirm]`、`[screen]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
 
 改完代码后重启，不需要碰那个终端：
 
@@ -189,6 +190,16 @@ echo "改了什么" > data/restart.request
 
 守护进程每秒检查一次这个文件：先让录音进程把最后一段写完再退出，`pyproject.toml` 变了就先 `uv sync`，
 然后重新执行自己，所以所有代码改动（包括守护进程本身）都会生效。`data/supervisor.json` 记录 pid、启动时间和重启次数。
+
+## 屏幕上下文
+
+`[screen] enabled` 默认关。关掉时不采样、不写 `screen` 事件，turn 和 route 跟以前一样。打开后 `./start.sh` 会拉起 `audi27 screen run`。
+
+只记录最前面的应用名、bundle id 和最前窗口的标题。不截图、不做 OCR、不读窗口里的文字。macOS 上一次 `osascript` 同时读这三样，保证标题属于同一个进程；脚本是固定的，不会把应用名或标题拼进去。调用有超时，卡住就杀掉整个进程组，已经打出来的半截输出丢掉。辅助功能被拒绝时改用 `lsappinfo` 只记应用名，并且只警告一次，之后不再调用 `osascript`。不是 macOS 就打一条日志，不写事件。
+
+应用或标题变了，并且稳住 `debounce_s`（默认 1 秒）才写一条，所以快速切换不会刷屏。抹掉标题发生在比较和写事件之前。`exclude_apps` 默认有 1Password（含 `com.agilebits.onepassword7`）、Bitwarden、钥匙串访问（含 `钥匙串访问` 和 `com.apple.keychainaccess`）。名字不区分大小写；带空格的名字会拿掉空格再对 bundle id，所以「Keychain Access」对得上 `com.apple.keychainaccess`。命中时只留应用名，标题抹掉。银行类应用不在默认列表里，要自己加。无痕窗口（标题里能看出 incognito、inprivate、无痕等）和 `redact_title_patterns` 会整段丢掉标题。标题最长 `max_title_chars`（默认 200）。
+
+采样进程活着时会改写 `data/screen.json`，里面只有 `started` 和 `updated` 两个时间，没有应用名，也没有标题。轮次结束时，如果这个心跳说明采样当时还在跑，就算上一条 `screen` 比 `stale_s`（默认 3600 秒）更老，也会记在 turn 上：没变化就不写事件，窗口还是那一个。心跳说明采样已经停了，或者这个进程是轮次之后才启动的，就不附带。没有心跳文件时，才用 `stale_s` 当最长时间。route 再抄过去，排除名单里的标题会再抹一次。发给 Grok Bot 还要另开 `[grokbot] include_screen`（默认关），发出去之前再抹一次。
 
 ## 对比页（仪表盘 → 模型对比）
 

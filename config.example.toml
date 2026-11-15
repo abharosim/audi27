@@ -133,6 +133,7 @@ header_name = "Authorization"
 header_value = "Bearer {key}"
 timeout_s = 10            # seconds for the POST; one retry, and only on a network error
 context_utterances = 0    # last N utterances included in the POST; 0 sends none. Max 20.
+include_screen = false    # also send the front app and window title; stays off so screen text is local
 reply_timeout_s = 1800    # no reply file in this many seconds -> task failed
 parse_retries = 3         # JSON parse errors before a reply file is quarantined
 
@@ -174,6 +175,42 @@ stale_s = 1.0         # older than this (or timestamped ahead of now) is unknown
 onset_ms = 60         # continuous speech before "speaking" (max 200, so the file is in time)
 hangover_ms = 400     # continuous silence before "quiet"; shorter gaps do not flap
 grace_s = 0.3         # after quiet, wait this long before the speaker starts
+
+# Frontmost app and window title only. Default off: nothing is sampled and turns
+# are unchanged. On macOS, `audi27 screen run` (and start.sh, when this is on)
+# polls the front app. The window title needs Accessibility permission; without
+# it the app name is still recorded. Other systems log once and write nothing.
+# No screenshots, no OCR, no window contents.
+# A snapshot is written only when the app or title changes, after it has held
+# for debounce_s. Excluded apps keep the app name and drop the title. Add bank
+# apps to exclude_apps. A private-window marker or a redact pattern drops the
+# whole title. Titles are cut to max_title_chars.
+# Turns and routes pick up the latest snapshot at the turn's end. While
+# `audi27 screen run` is alive it rewrites data/screen.json (timestamps only).
+# That heartbeat means a change-only event older than stale_s is still the
+# front window. If the heartbeat shows the sampler had stopped, or this
+# process started after the turn, nothing is attached. With no heartbeat file,
+# stale_s is the age limit. Sent to Grok Bot only when [grokbot] include_screen
+# is true. An excluded title is dropped again at attach time and before the POST.
+[screen]
+enabled = false
+poll_s = 2.0
+debounce_s = 1.0
+stale_s = 3600
+max_title_chars = 200
+exclude_apps = [
+    "1Password",
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.agilebits.onepassword",
+    "Bitwarden",
+    "com.bitwarden.desktop",
+    "Keychain Access",
+    "钥匙串访问",
+    "com.apple.keychainaccess",
+]
+redact_title_patterns = []
+private_title_markers = ["incognito", "inprivate", "private browsing", "private window", "无痕", "隐私浏览"]
 
 [store]
 data_dir = "data"

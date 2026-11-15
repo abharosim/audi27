@@ -106,6 +106,9 @@ class GrokbotCfg:
     header_value: str = "Bearer {key}"
     timeout_s: float = 10.0
     context_utterances: int = 0  # last N utterances in the POST; 0 sends none
+    # Front app and window title on the POST, and only then. Default off:
+    # screen context stays on this machine. Requires [screen] enabled as well.
+    include_screen: bool = False
     reply_timeout_s: float = 1800.0
     parse_retries: int = 3  # JSON parse errors before a reply file is quarantined
 
@@ -147,6 +150,41 @@ class PresenceCfg:
 
 
 @dataclass
+class ScreenCfg:
+    # `audi27 supervise` starts `screen run` only when this is true. Default off:
+    # no sampling and no screen events, and turns/routes are unchanged.
+    enabled: bool = False
+    poll_s: float = 2.0          # how often the front app is read
+    debounce_s: float = 1.0      # a snapshot must hold this long before it is written
+    # With no sampler heartbeat, an event older than this is not attached.
+    # A live sampler (data/screen.json) may attach an older change-only snapshot;
+    # a stopped sampler attaches nothing, even inside this window.
+    stale_s: float = 3600.0
+    max_title_chars: int = 200
+    # App name or bundle id. A match keeps the app name and drops the title.
+    # "Keychain Access" also matches com.apple.keychainaccess, and "1Password"
+    # also matches com.agilebits.onepassword7. Banking apps are not listed;
+    # add them here.
+    exclude_apps: list = field(default_factory=lambda: [
+        "1Password",
+        "com.1password.1password",
+        "com.agilebits.onepassword7",
+        "com.agilebits.onepassword",
+        "Bitwarden",
+        "com.bitwarden.desktop",
+        "Keychain Access",
+        "钥匙串访问",
+        "com.apple.keychainaccess",
+    ])
+    # A title matching any of these (case-insensitive) is dropped whole.
+    redact_title_patterns: list = field(default_factory=list)
+    # Substrings that mark a private/incognito browser window. The title is then dropped.
+    private_title_markers: list = field(default_factory=lambda: [
+        "incognito", "inprivate", "private browsing", "private window", "无痕", "隐私浏览",
+    ])
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -174,6 +212,7 @@ class Config:
     queue: QueueCfg = field(default_factory=QueueCfg)
     speak: SpeakCfg = field(default_factory=SpeakCfg)
     presence: PresenceCfg = field(default_factory=PresenceCfg)
+    screen: ScreenCfg = field(default_factory=ScreenCfg)
     backend: dict = field(default_factory=dict)  # name -> constructor kwargs
     corrector: dict = field(default_factory=dict)  # name -> constructor kwargs
 
@@ -248,6 +287,7 @@ def _check_all(cfg: Config) -> None:
     _check_queue(cfg)
     _check_speak(cfg)
     _check_presence(cfg)
+    _check_screen(cfg)
 
 
 def _check_route(cfg: Config) -> None:
@@ -328,6 +368,8 @@ def _check_grokbot(cfg: Config) -> None:
         raise ConfigError("grokbot.parse_retries must be an integer")
     if g.parse_retries < 1:
         raise ConfigError("grokbot.parse_retries must be >= 1")
+    if not isinstance(g.include_screen, bool):
+        raise ConfigError("grokbot.include_screen must be true or false")
 
 
 def _check_confirm(cfg: Config) -> None:
@@ -365,6 +407,45 @@ def _as_float(value, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{name} must be a number")
     return float(value)
+
+
+def _string_list(value, name: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{name} must be a list of strings")
+    cleaned = []
+    for item in value:
+        text = item.strip()
+        if not text:
+            raise ConfigError(f"{name} must not contain a blank entry")
+        cleaned.append(text)
+    return cleaned
+
+
+def _check_screen(cfg: Config) -> None:
+    s = cfg.screen
+    if not isinstance(s.enabled, bool):
+        raise ConfigError("screen.enabled must be true or false")
+    s.poll_s = _as_float(s.poll_s, "screen.poll_s")
+    s.debounce_s = _as_float(s.debounce_s, "screen.debounce_s")
+    s.stale_s = _as_float(s.stale_s, "screen.stale_s")
+    if s.poll_s <= 0 or s.poll_s > 3600:
+        raise ConfigError("screen.poll_s must be > 0 and <= 3600")
+    if s.debounce_s < 0 or s.debounce_s > 3600:
+        raise ConfigError("screen.debounce_s must be between 0 and 3600")
+    if s.stale_s < 0:
+        raise ConfigError("screen.stale_s must be >= 0")
+    if isinstance(s.max_title_chars, bool) or not isinstance(s.max_title_chars, int):
+        raise ConfigError("screen.max_title_chars must be an integer")
+    if not 1 <= s.max_title_chars <= 2000:
+        raise ConfigError("screen.max_title_chars must be from 1 to 2000")
+    s.exclude_apps = _string_list(s.exclude_apps, "screen.exclude_apps")
+    s.private_title_markers = _string_list(s.private_title_markers, "screen.private_title_markers")
+    s.redact_title_patterns = _string_list(s.redact_title_patterns, "screen.redact_title_patterns")
+    for pattern in s.redact_title_patterns:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ConfigError(f"screen.redact_title_patterns {pattern!r} is not a valid regex: {e}") from e
 
 
 def _check_presence(cfg: Config) -> None:

@@ -698,10 +698,42 @@ def route_id(turn_id: str) -> str:
     return "route-" + turn_id
 
 
-def route_event(turn: dict, decision: Decision) -> dict:
-    """One `route` event. The id is fixed from the turn id, so a replay can be repeated."""
-    return make_event("route", ROUTE_SOURCE, decision.data(), ts=turn["ts"],
+def route_event(turn: dict, decision: Decision, *, screen: dict | None = None) -> dict:
+    """One `route` event. The id is fixed from the turn id, so a replay can be repeated.
+
+    `screen` is the public app/title snapshot already chosen for this turn.
+    Omit it and the event has no screen field.
+    """
+    data = decision.data()
+    if screen:
+        from .screen import public_context
+
+        view = public_context(screen)
+        if view:
+            data["screen"] = view
+    return make_event("route", ROUTE_SOURCE, data, ts=turn["ts"],
                       ref=turn["id"], id=route_id(turn["id"]))
+
+
+def _screen_for_route(data_dir, cfg, turn: dict) -> dict | None:
+    """Screen context for this turn when `[screen] enabled`, else None.
+
+    A snapshot already stored on the turn wins. Otherwise the latest screen
+    event at the turn's timestamp is used, when the sampler's heartbeat says
+    that snapshot was still current. An excluded app's title is dropped again
+    here, including one that was stored before the app was excluded.
+    """
+    from .screen import _strip_excluded, context_for, enabled, public_context
+
+    if not enabled(cfg):
+        return None
+    data = turn.get("data") if isinstance(turn.get("data"), dict) else {}
+    attached = data.get("screen")
+    if isinstance(attached, dict):
+        view = public_context(attached)
+        if view is not None:
+            return _strip_excluded(view, cfg)
+    return context_for(data_dir, cfg, turn.get("ts"))
 
 
 def format_decision(decision: Decision) -> str:
@@ -779,7 +811,8 @@ def replay_routes(data_dir, cfg, *, since=None, until=None, classify=None) -> li
     out = []
     for event in replay(data_dir, since=since, until=until, types="turn"):
         rules = get_rules(cfg.route.rules, strict=True)
-        out.append(route_event(event, decide(_turn_text(event), rules, classify=classify, timeout_s=timeout)))
+        decision = decide(_turn_text(event), rules, classify=classify, timeout_s=timeout)
+        out.append(route_event(event, decision, screen=_screen_for_route(data_dir, cfg, event)))
     return out
 
 
@@ -836,7 +869,7 @@ def _emit(data_dir, turn: dict, cfg, classify) -> bool:
     try:
         rules = get_rules(cfg.route.rules, strict=False)
         decision = decide(_turn_text(turn), rules, classify=classify, timeout_s=cfg.route.timeout_s)
-        event = route_event(turn, decision)
+        event = route_event(turn, decision, screen=_screen_for_route(data_dir, cfg, turn))
     except Exception:
         log.exception("route skipped turn %s", turn.get("id"))
         return True
