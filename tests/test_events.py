@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -117,12 +118,21 @@ def test_day_rollover_uses_local_time(tmp_path):
         late = datetime.fromisoformat("2026-11-15T23:30:00+08:00")
         # 16:30Z is 00:30 the next day in Shanghai, even though the original date says the 15th.
         early = datetime.fromisoformat("2026-11-15T16:30:00+00:00")
+        edge = datetime.fromisoformat("2026-11-15T23:59:59.999+08:00")
+        midnight = datetime.fromisoformat("2026-11-16T00:00:00+08:00")
         emit(data, "presence", "capture", {"state": "speaking"}, id="late", ts=late)
+        emit(data, "presence", "capture", {"state": "speaking"}, id="edge", ts=edge)
+        emit(data, "presence", "capture", {"state": "quiet"}, id="midnight", ts=midnight)
         emit(data, "presence", "capture", {"state": "quiet"}, id="early", ts=early)
         files = sorted(p.name for p in (data / "events").glob("*.jsonl"))
         assert files == ["2026-11-15.jsonl", "2026-11-16.jsonl"]
-        assert _ids(replay(data, since=datetime.fromisoformat("2026-11-16T00:00:00+08:00"))) == ["early"]
-        assert json.loads((data / "events" / "2026-11-16.jsonl").read_text())["ts"].endswith("+08:00")
+        # since is inclusive, until is exclusive, and the file prefilter must not drop the boundary day.
+        from audi27.store import parse_when
+        assert _ids(replay(data, since=parse_when("2026-11-15"),
+                           until=parse_when("2026-11-15", end_of_day=True))) == ["late", "edge"]
+        assert _ids(replay(data, since=midnight)) == ["midnight", "early"]
+        for line in (data / "events" / "2026-11-16.jsonl").read_text().splitlines():
+            assert json.loads(line)["ts"].endswith("+08:00")
     finally:
         if old is None:
             os.environ.pop("TZ", None)
@@ -131,19 +141,21 @@ def test_day_rollover_uses_local_time(tmp_path):
         time.tzset()
 
 
-def _worker(data_dir, n, prefix):
-    for i in range(n):
-        emit(data_dir, "marker", prefix, {"i": i, "blob": prefix * 400}, id=f"{prefix}-{i}")
-
-
 def test_concurrent_appends_do_not_interleave(tmp_path):
     data = str(tmp_path / "data")
     n, writers = 30, 6
+    # The test process is chdir'd to a temp dir, so point the children at the repo that holds audi27.
+    root = str(Path(__file__).resolve().parents[1])
+    code = (
+        "import sys\n"
+        "from audi27.events import emit\n"
+        "data, n, prefix = sys.argv[1], int(sys.argv[2]), sys.argv[3]\n"
+        "for i in range(n):\n"
+        "    emit(data, 'marker', prefix, {'i': i, 'blob': prefix * 400}, id=f'{prefix}-{i}')\n"
+    )
     procs = [
-        subprocess.Popen([sys.executable, "-c",
-                          "import sys; from tests.test_events import _worker; "
-                          "_worker(sys.argv[1], int(sys.argv[2]), sys.argv[3])",
-                          data, str(n), f"p{i}"], cwd="/workspace", stderr=subprocess.PIPE, text=True)
+        subprocess.Popen([sys.executable, "-c", code, data, str(n), f"p{i}"],
+                         cwd=root, stderr=subprocess.PIPE, text=True)
         for i in range(writers)
     ]
     codes = []
@@ -272,6 +284,47 @@ def test_follow_waits_for_a_partial_line_to_finish(tmp_path):
     assert seen == ["first", "second"]
 
 
+def test_follow_sees_a_file_created_after_it_starts(tmp_path):
+    """Tail must notice a day file that does not exist yet (midnight rollover, first event of a run)."""
+    data = tmp_path / "data"
+    ready, stop = threading.Event(), threading.Event()
+    seen = []
+
+    def consume():
+        for ev in follow(data, poll=0.02, stop=stop, ready=ready):
+            seen.append(ev["id"])
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    assert ready.wait(2)
+    emit(data, "presence", "capture", {"state": "speaking"}, id="born")
+    deadline = time.time() + 2
+    while "born" not in seen and time.time() < deadline:
+        time.sleep(0.02)
+    emit(data, "presence", "capture", {"state": "quiet"}, id="next-day",
+         ts=datetime.now().astimezone() + timedelta(days=1))
+    deadline = time.time() + 2
+    while "next-day" not in seen and time.time() < deadline:
+        time.sleep(0.02)
+    stop.set()
+    thread.join(2)
+    assert len(list((data / "events").glob("*.jsonl"))) == 2
+    assert seen == ["born", "next-day"] and not thread.is_alive()
+
+
+def test_replay_since_inclusive_until_exclusive(tmp_path):
+    data = tmp_path / "data"
+    before = datetime(2026, 11, 15, 23, 59, 59, 999000, tzinfo=timezone.utc)
+    at = datetime(2026, 11, 16, 0, 0, tzinfo=timezone.utc)
+    after = datetime(2026, 11, 16, 0, 0, 0, 1000, tzinfo=timezone.utc)
+    emit(data, "ping", "mod", {}, id="before", ts=before)
+    emit(data, "ping", "mod", {}, id="at", ts=at)
+    emit(data, "ping", "mod", {}, id="after", ts=after)
+    assert _ids(replay(data, since=before, until=at)) == ["before"]
+    assert _ids(replay(data, since=at, until=after)) == ["at"]
+    assert _ids(replay(data, since=at)) == ["at", "after"]
+
+
 # --- ref chain --------------------------------------------------------------
 def test_ref_chain_walks_back_to_the_origin(tmp_path):
     data = tmp_path / "data"
@@ -309,9 +362,64 @@ def test_backfill_utterances_is_idempotent(tmp_path):
     assert by_id["e"]["data"]["status"] == "rejected"
     assert by_id["m"]["ts"] == datetime.fromisoformat(morning).astimezone().isoformat(timespec="milliseconds")
     assert backfill_utterances(store.root) == {"wrote": 0, "skipped": 2}
+    # same window as a datetime, passed the way replay accepts an ISO string
+    assert backfill_utterances(store.root, since="2026-11-15T12:00:00+00:00") == {"wrote": 0, "skipped": 1}
     assert len(list(replay(store.root))) == 2
     built = utterance_event(_record("m", morning, "早上"))
     assert built["id"] == "m" and built["type"] == "utterance" and built["data"]["text"] == "早上"
+
+
+def test_if_absent_repairs_a_torn_complete_line(tmp_path):
+    """JSON written, newline not: the id is already there, but readers must not skip the line forever."""
+    data = tmp_path / "data"
+    ev = make_event("utterance", "transcribe", {"text": "hello"}, id="u1",
+                    ts=datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc))
+    day = datetime.fromisoformat(ev["ts"]).astimezone().strftime("%Y-%m-%d")
+    path = data / "events" / f"{day}.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(json.dumps(ev, ensure_ascii=False).encode())
+    assert list(replay(data)) == []
+    assert append(data, ev, if_absent=True) is None
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n") and raw.count(b"\n") == 1
+    assert _ids(replay(data)) == ["u1"]
+    assert append(data, ev, if_absent=True) is None
+    assert raw == path.read_bytes()
+
+
+def test_backfill_repairs_a_torn_utterance_without_duplicating(tmp_path):
+    store = Store(tmp_path / "data")
+    start = "2026-11-14T12:00:00+00:00"
+    rec = _record("m", start, "早上")
+    store.append(rec)
+    ev = utterance_event(rec)
+    day = datetime.fromisoformat(ev["ts"]).astimezone().strftime("%Y-%m-%d")
+    path = store.root / "events" / f"{day}.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(json.dumps(ev, ensure_ascii=False).encode())
+    assert list(replay(store.root)) == []
+    assert backfill_utterances(store.root) == {"wrote": 0, "skipped": 1}
+    assert _ids(replay(store.root)) == ["m"]
+    assert path.read_bytes().count(b"\n") == 1
+    assert backfill_utterances(store.root) == {"wrote": 0, "skipped": 1}
+
+
+def test_unicode_line_separators_stay_inside_one_record(tmp_path):
+    data = tmp_path / "data"
+    text = "a\u2028b\u2029c\u0085d"
+    ts = "2026-11-15T12:00:00.000+00:00"
+    hand = {"id": "hand", "ts": ts, "type": "screen", "source": "screen", "ref": None, "data": {"text": text}}
+    path = data / "events" / "x.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_bytes((json.dumps(hand, ensure_ascii=False) + "\n").encode())
+    assert list(replay(data))[0]["data"]["text"] == text
+
+    emit(data, "screen", "screen", {"text": text}, id="esc", ts=datetime.fromisoformat(ts))
+    esc_line = next(line for p in (data / "events").glob("*.jsonl") for line in p.read_bytes().split(b"\n")
+                    if b'"id": "esc"' in line)
+    assert b"\xe2\x80\xa8" not in esc_line and b"\xe2\x80\xa9" not in esc_line and b"\xc2\x85" not in esc_line
+    by_id = {e["id"]: e for e in replay(data)}
+    assert by_id["hand"]["data"]["text"] == text and by_id["esc"]["data"]["text"] == text
 
 
 def test_pipeline_emits_utterance_without_changing_transcripts(tmp_path):
@@ -346,6 +454,38 @@ def test_pipeline_emits_utterance_without_changing_transcripts(tmp_path):
     ev = events[0]
     assert ev["type"] == "utterance" and ev["source"] == "transcribe" and ev["ref"] is None
     assert ev["id"] == rec["id"] and ev["data"]["text"] == rec["text"] and ev["data"]["status"] == "ok"
+    assert store.pending() == []
+
+
+def test_spool_left_after_the_transcript_emits_one_utterance(tmp_path):
+    """Crash after the transcript is durable and before the spool file is removed: one utterance, no second transcript."""
+    from audi27 import config as C
+    from audi27.pipeline import Pipeline
+    from audi27.segmenter import Segment
+    from audi27.store import _dt, search
+    from audi27.transcribers import Transcriber
+    import numpy as np
+
+    class Boom(Transcriber):
+        name, model = "fake", "m"
+
+        def transcribe(self, wav, language=None, prompt=None):
+            raise AssertionError("transcript already stored")
+
+    ts = 1_800_000_000.0
+    store = Store(tmp_path / "data", "none")
+    wav = store.spool_wav(Segment(np.zeros(SR, np.int16), ts, SR, 1.0))
+    original = wav.read_bytes()
+    store.append(_record(wav.stem, _dt(ts).isoformat(timespec="milliseconds"), "kept"))
+    p = Pipeline(C.Config(), [Boom()], store)
+    p.drain()
+    assert [r["text"] for r in search(store.root, ["kept"])] == ["kept"]
+    assert _ids(replay(store.root)) == [wav.stem]
+    assert store.pending() == []
+    wav.write_bytes(original)  # same crash window again, after the utterance exists
+    p.drain()
+    assert [r["text"] for r in search(store.root, ["kept"])] == ["kept"]
+    assert _ids(replay(store.root)) == [wav.stem]
     assert store.pending() == []
 
 

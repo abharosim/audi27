@@ -12,7 +12,7 @@ unchanged; do not reject unknown types.
 Several processes may append at once. Each append takes an exclusive flock,
 closes a torn trailing line left by a crash, writes one full line, and fsyncs
 before unlocking. Readers take a shared lock and still skip a partial last line
-and any line that is not a valid event.
+and any line that is not a valid event. Lines are split on LF only.
 """
 from __future__ import annotations
 
@@ -129,20 +129,27 @@ def _read_fd(fd: int) -> bytes:
     return b"".join(chunks)
 
 
-def _close_torn_tail(fd: int) -> None:
-    """A crash can leave a partial last line. End it so the next event is not glued onto those bytes."""
+def _close_torn_tail(fd: int) -> bool:
+    """End a crash-torn last line so the next event is not glued onto it. True if a newline was added."""
     size = os.lseek(fd, 0, os.SEEK_END)
     if size <= 0:
-        return
+        return False
     os.lseek(fd, size - 1, os.SEEK_SET)
     if os.read(fd, 1) != b"\n":
         _write_all(fd, b"\n")
+        return True
+    return False
+
+
+def _json_lines(blob: bytes) -> list[str]:
+    """LF-delimited records. U+2028 / U+2029 / U+0085 can sit inside a JSON string; they are not boundaries."""
+    return [line for line in blob.decode("utf-8", errors="replace").split("\n") if line.strip()]
 
 
 def _ids_in(fd: int) -> set[str]:
     os.lseek(fd, 0, os.SEEK_SET)
     found = set()
-    for line in _read_fd(fd).decode("utf-8", errors="replace").splitlines():
+    for line in _json_lines(_read_fd(fd)):
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -166,19 +173,39 @@ def _exclusive(path: Path, body):
         os.close(fd)
 
 
+# json.dumps leaves these raw when ensure_ascii is false, but they are line breaks for
+# str.splitlines and for some other languages' "split on newlines". Escape them so a record
+# stays one LF-terminated line no matter who reads it.
+_EXTRA_LINE_BREAKS = (
+    ("\u2028", "\\u2028"),
+    ("\u2029", "\\u2029"),
+    ("\u0085", "\\u0085"),
+)
+
+
 def _line(ev: dict) -> bytes:
-    return (json.dumps(ev, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    text = json.dumps(ev, ensure_ascii=False, allow_nan=False)
+    for ch, esc in _EXTRA_LINE_BREAKS:
+        if ch in text:
+            text = text.replace(ch, esc)
+    return (text + "\n").encode("utf-8")
 
 
 def append(data_dir: str | Path, event: dict, *, if_absent: bool = False) -> dict | None:
-    """Validate and append one event. Returns the stored event, or None when `if_absent` and the id is already there."""
+    """Validate and append one event. Returns the stored event, or None when `if_absent` and the id is already there.
+
+    A torn tail is closed before the id check. Otherwise a crash that wrote a whole JSON value
+    but not its newline would look present and stay invisible to readers forever.
+    """
     ev = _canonical(event)
     path = _day_path(data_dir, ev["ts"])
 
     def body(fd: int):
+        repaired = _close_torn_tail(fd)
         if if_absent and ev["id"] in _ids_in(fd):
+            if repaired:
+                os.fsync(fd)
             return None
-        _close_torn_tail(fd)
         _write_all(fd, _line(ev))
         os.fsync(fd)
         return ev
@@ -282,9 +309,7 @@ def _read_complete(path: Path, offset: int) -> tuple[list[dict], int]:
             return [], offset
         blob = blob[:cut + 1]
     events = []
-    for line in blob.decode("utf-8", errors="replace").splitlines():
-        if not line.strip():
-            continue
+    for line in _json_lines(blob):
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -395,8 +420,13 @@ def ref_chain(data_dir: str | Path, event_id: str) -> list[dict]:
 
 
 def _append_missing(path: Path, batch: list[dict]) -> tuple[int, int]:
-    """Append events whose ids are not already in `path`. One lock, one fsync."""
+    """Append events whose ids are not already in `path`. One lock, one fsync.
+
+    Closes a torn tail even when every id is already there, so a retried backfill makes
+    a crash-cut last line visible instead of counting it as skipped and leaving it unread.
+    """
     def body(fd: int) -> tuple[int, int]:
+        repaired = _close_torn_tail(fd)
         have = _ids_in(fd)
         fresh = []
         wrote = skipped = 0
@@ -408,8 +438,9 @@ def _append_missing(path: Path, batch: list[dict]) -> tuple[int, int]:
             fresh.append(_line(ev))
             wrote += 1
         if fresh:
-            _close_torn_tail(fd)
             _write_all(fd, b"".join(fresh))
+            os.fsync(fd)
+        elif repaired:
             os.fsync(fd)
         return wrote, skipped
 
@@ -420,9 +451,14 @@ def backfill_utterances(data_dir: str | Path, *, since=None, until=None) -> dict
     """Copy transcript records into `utterance` events. Safe to repeat: an id already present is skipped.
 
     Returns `{"wrote", "skipped"}`. Transcripts are not modified.
+
+    `since` / `until` accept the same values as `replay`: an aware datetime, or an ISO 8601
+    string with an offset. `since` is inclusive and `until` is exclusive.
     """
+    since_dt = None if since is None else _parse_ts(since)
+    until_dt = None if until is None else _parse_ts(until)
     grouped: dict[Path, list[dict]] = {}
-    for rec in iter_records(data_dir, since, until):
+    for rec in iter_records(data_dir, since_dt, until_dt):
         if not rec.get("id") or not rec.get("start"):
             continue
         ev = utterance_event(rec)
