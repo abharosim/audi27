@@ -1,9 +1,10 @@
 """`audi27 supervise`: keep the recorder and the dashboard running.
 
-- a child that exits is started again (1 s -> 30 s backoff)
-- when data/restart.request appears, both children are stopped cleanly and the supervisor
-  re-executes itself, so every code change (including to this file) is picked up
-- data/supervisor.json records pid / start time / restart count, so a restart can be confirmed
+`[turns] enabled` and `[route] enabled` add those processes. A child that exits is
+started again on its own (1 s -> 30 s backoff). When data/restart.request appears,
+every child is stopped cleanly and the supervisor re-executes itself, so a code
+change (including to this file) is picked up. data/supervisor.json records pid,
+start time, and restart count.
 """
 from __future__ import annotations
 
@@ -104,17 +105,21 @@ def supervise(data_dir: str | Path, specs: dict[str, list[str]], reexec, poll_s:
         _stop(procs, grace_s)
 
 
-def child_specs(config_path: str | None, host: str, port: int, *, turns: bool = False) -> dict[str, list[str]]:
-    """Recorder and dashboard, plus the live turn assembler when `[turns] enabled` is set."""
+def child_specs(config_path: str | None, host: str, port: int, *, turns: bool = False,
+                 route: bool = False) -> dict[str, list[str]]:
+    """Recorder and dashboard, plus live turns and the router when their `[enabled]` flags are set."""
     base = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     specs = {"run": base + ["run"], "web": base + ["web", "--host", host, "--port", str(port)]}
     if turns:
         specs["turns"] = base + ["turns", "run"]
+    if route:
+        specs["route"] = base + ["route", "run"]
     return specs
 
 
-def main(config_path: str | None, data_dir: str, host: str, port: int, *, turns: bool = False) -> None:
-    specs = child_specs(config_path, host, port, turns=turns)
+def main(config_path: str | None, data_dir: str, host: str, port: int, *, turns: bool = False,
+         route: bool = False) -> None:
+    specs = child_specs(config_path, host, port, turns=turns, route=route)
     argv = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     argv += ["supervise", "--host", host, "--port", str(port)]
     supervise(data_dir, specs, lambda: os.execv(sys.executable, argv))

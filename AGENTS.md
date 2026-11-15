@@ -68,6 +68,16 @@ uv run audi27 turns run                           # follow the stream and emit t
 
 Utterances are merged by audio time, not file order: a retried segment or a backfill can be appended after a later one. Close reasons: `gap` (audio gap greater than `gap_s`, default 2 s), `max` (audio span reached `max_duration_s`, default 120 s), `new_trigger`, `timeout` (live idle `wall_close_s`, default 8 s, measured from when the last utterance was seen; the batch is ordered before the close), `eof` (replay ended, or the live process is stopping). The first `turns run` starts at the end of the stream. A restart resumes from `data/turns.cursor.json` and does not write a turn id again. Replay is deterministic and does not append to the live stream unless `--write`. `[turns] enabled = true` makes `audi27 supervise` start `turns run` as well; if that process crashes, only it is restarted.
 
+## Routes
+
+`audi27 route` reads `turn` events and writes one `route` (`id` = `route-<turn id>`, `ref` = the turn id). It does not message any agent. Rules are `routes.toml` when that file exists, otherwise `routes.example.toml`, re-read on every turn. Explicit agent names win (including ASR spellings such as Cloud Code and grog), then a whole-turn queue command (`command`: details / skip / later / pending / close), then a whole-turn "not a command" (`target` `none`), then keyword rules (career topics → muse), then the default (grok). Claude Code and the local model are chosen only when named. `[route] llm = true` asks the corrector's local model about leftovers, with `timeout_s` and a fallback to the default; tests inject `classify`. `needs_confirmation` is a keyword hit for send-email / pay / delete / push / post. The dashboard 路由 tab stores ✓/✗ in `data/route_verdicts.jsonl` (last line per id wins) and shows the running accuracy. Replay prints only; `--write` appends. The first `route run` starts at the end of the stream (`data/route.cursor.json`). `[route] enabled = true` (default off) starts it from `audi27 supervise`; turns need to be enabled too or there is nothing to route.
+
+```bash
+uv run audi27 route test "帮我问一下 Muse 下个月面试怎么准备"
+uv run audi27 route replay --since today --json   # print only; add --write to append
+uv run audi27 route run
+```
+
 ## Replays
 
 `data/evals/<label>.jsonl` holds re-transcriptions of the same audio by other models (same `id` as the live record).

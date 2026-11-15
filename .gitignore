@@ -3,4 +3,5 @@ data/
 __pycache__/
 *.pyc
 config.toml
+routes.toml
 .env
