@@ -5,10 +5,13 @@ This module is the only thing that sticks them back together. It reads `utteranc
 events and, in live mode, writes `turn` events. It does not import the recorder,
 the corrector, or the router.
 
-A turn starts only when the utterance text, after leading whitespace, begins with
-a trigger. 大大 is a normal word, so a match in the middle of a sentence is not a
-trigger; Latin variants also need a word boundary, so "dadapple" does not match.
-The default spellings are 达达, 哒哒, 大大, DaDa, dada, and Dada. Latin triggers are
+A turn starts only when the utterance text, after leading whitespace and
+invisible format characters, begins with a trigger. 大大 is a normal word, so a
+match in the middle of a sentence is not a trigger, and neither is 大大 as the
+head of an AABB word (大大小小, 大大方方). Latin variants also need a word
+boundary, so "dadapple" and "dada's" (straight or curly apostrophe, fullwidth
+digit) do not match. Fullwidth Latin is matched as its halfwidth form. The
+default spellings are 达达, 哒哒, 大大, DaDa, dada, and Dada. Latin triggers are
 case-insensitive. Do not "fix" 大大 via the context.md glossary: that replacement
 runs on the whole sentence, not only at the start.
 
@@ -23,35 +26,43 @@ span reaches `max_duration_s` (the utterance that crosses the cap is kept), or
 another trigger arrives. A trigger after a long gap closes the old turn as
 `gap`; a trigger inside the gap closes it as `new_trigger`.
 
-Replay (`feed` / `assemble_replay`) uses only those utterance timestamps, then
-closes a leftover turn as `eof`. It never reads the wall clock, so the same
-events always produce the same turns. Live mode also closes a turn that nothing
-has joined for `wall_close_s` after the utterance was *seen* (`timeout`). The
-wait is measured from receipt, not from the audio end: the event is already late
-by the time transcription writes it, and the next piece of the same command may
-still be in the transcriber. Merging itself stays on the audio gap.
+`feed` / `assemble_replay` order utterances by audio start (file order is not
+trusted: a retried segment or a backfill can land later in the file), then use
+only those timestamps, then close a leftover turn as `eof`. They never read the
+wall clock, so the same events always produce the same turns.
+
+Live mode holds what it has seen until the stream has been idle for
+`wall_close_s` (`timeout` when nothing follows; `gap` / `new_trigger` / `max`
+when the ordered audio says so). The wait is measured from receipt, not from
+the audio end: transcription is already late, and a later line in the file can
+be an earlier segment. The first start snapshots the end of the stream and does
+not backfill; the cursor is `turns.cursor.json`, so a restart continues there
+and does not emit a turn id that was already written.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import queue
 import threading
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .events import append, follow, make_event, replay
+from .events import append, make_event, read_new, replay, snapshot_offsets
 
 log = logging.getLogger("audi27.turns")
 
 TURN_SOURCE = "turns"
 DEFAULT_TRIGGERS = ("达达", "哒哒", "大大", "DaDa", "dada", "Dada")
 # Apostrophes keep "dada's" from matching; a real command is "dada" then a break.
-_LATIN_STUCK = "'’"
+# Curly and fullwidth quotes are what a transcript actually contains; the ASCII
+# apostrophe alone is not enough (see _stuck_to_latin).
+_LATIN_STUCK = frozenset("'’‘＇ʼ")
+_CURSOR_NAME = "turns.cursor.json"
+_EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
 
 
 @dataclass
@@ -103,12 +114,22 @@ class _Utt:
     end_s: str
 
 
+def _fold(text: str) -> str:
+    """Halfwidth, case-insensitive form. Fullwidth ＤＡＤＡ and DADA compare equal."""
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
 def _latin_trigger(trig: str) -> bool:
-    return trig.isascii() and any(c.isalpha() for c in trig)
+    folded = unicodedata.normalize("NFKC", trig)
+    return folded.isascii() and any(c.isalpha() for c in folded)
 
 
 def _stuck_to_latin(ch: str) -> bool:
-    return ch.isascii() and (ch.isalnum() or ch in _LATIN_STUCK)
+    """True when `ch` continues a Latin token (dadapple, dada's, dada２)."""
+    if ch in _LATIN_STUCK:
+        return True
+    folded = unicodedata.normalize("NFKC", ch)
+    return any(c in _LATIN_STUCK or (c.isascii() and c.isalnum()) for c in folded)
 
 
 def _is_sep(ch: str) -> bool:
@@ -117,15 +138,41 @@ def _is_sep(ch: str) -> bool:
     return unicodedata.category(ch)[:1] in "PS"
 
 
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return 0x3400 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0x20000 <= o <= 0x2A6DF
+
+
+def _strip_leading_ignorable(text: str) -> str:
+    """Drop leading whitespace and format characters (BOM, zero-width space)."""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isspace() or unicodedata.category(ch) == "Cf":
+            i += 1
+            continue
+        break
+    return text[i:]
+
+
+def _aabb_after_dada(body: str, head: str) -> bool:
+    """大大方方 / 大大小小 is one word. 大大，… and 大大的… stay a wake word."""
+    if head != "大大":
+        return False
+    rest = body[len(head):]
+    return len(rest) >= 2 and rest[0] == rest[1] and _is_cjk(rest[0])
+
+
 def match_trigger(text: str, triggers) -> str | None:
     """Surface form of the trigger at the start of `text`, or None.
 
-    Leading whitespace is ignored. The returned string is the characters as
-    written (so "DADA" stays "DADA"), not the configured spelling.
+    Leading whitespace and format characters are ignored. The returned string
+    is the characters as written (so "DADA" stays "DADA", fullwidth stays
+    fullwidth), not the configured spelling.
     """
     if not isinstance(text, str) or not text:
         return None
-    body = text.lstrip()
+    body = _strip_leading_ignorable(text)
     best = None
     best_len = -1
     for trig in triggers:
@@ -135,13 +182,13 @@ def match_trigger(text: str, triggers) -> str | None:
         if not trig or len(body) < len(trig):
             continue
         head = body[:len(trig)]
+        if len(head) != len(trig) or _fold(head) != _fold(trig):
+            continue
         if _latin_trigger(trig):
-            if head.lower() != trig.lower():
-                continue
             nxt = body[len(trig):len(trig) + 1]
             if nxt and _stuck_to_latin(nxt):
                 continue
-        elif head != trig:
+        elif _aabb_after_dada(body, head):
             continue
         if len(head) > best_len:
             best, best_len = head, len(head)
@@ -149,7 +196,7 @@ def match_trigger(text: str, triggers) -> str | None:
 
 
 def _strip_trigger(text: str, surface: str) -> str:
-    rest = text.lstrip()[len(surface):]
+    rest = _strip_leading_ignorable(text)[len(surface):]
     i = 0
     while i < len(rest) and _is_sep(rest[i]):
         i += 1
@@ -235,6 +282,7 @@ class TurnAssembler:
         self.wall_close_s = float(wall_close_s)
         self._clock = clock or time.monotonic
         self._pending: _Pending | None = None
+        self._seen: set[str] = set()
 
     @classmethod
     def from_config(cls, cfg, clock=None) -> "TurnAssembler":
@@ -246,6 +294,9 @@ class TurnAssembler:
         utt = _parse(obj)
         if utt is None:
             return []
+        if utt.id in self._seen:
+            return []
+        self._seen.add(utt.id)
         closed: list[Turn] = []
         surface = match_trigger(utt.text, self.triggers)
         if surface is not None:
@@ -282,8 +333,13 @@ class TurnAssembler:
         return [self._close("eof")]
 
     def feed(self, records) -> list[Turn]:
+        """Fold `records` in audio-time order, then close a leftover turn as `eof`.
+
+        Arrival order is not used. A later line with an earlier timestamp is a
+        continuation or an earlier command, not "the next utterance".
+        """
         out: list[Turn] = []
-        for rec in records:
+        for rec in _order_records(list(records)):
             out.extend(self.push(rec))
         out.extend(self.finish())
         return out
@@ -355,15 +411,42 @@ def format_turn(turn: Turn) -> str:
     return f"{stamp} {mark} {turn.reason:<12} {len(turn.utterance_ids)}utt  [{turn.trigger}] {turn.text}"
 
 
+def _order_records(records: list) -> list:
+    """Audio start, then input order. The same utterance id is kept once.
+
+    Records that do not parse sort first and are left for `push` to skip, so one
+    bad line cannot hide a later command or change the gap around it.
+    """
+    keyed = []
+    for index, rec in enumerate(records):
+        utt = _parse(rec)
+        when = utt.start if utt is not None else _EARLIEST
+        keyed.append((when, index, rec, None if utt is None else utt.id))
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    seen: set[str] = set()
+    ordered = []
+    for _, _, rec, ident in keyed:
+        if ident is not None:
+            if ident in seen:
+                continue
+            seen.add(ident)
+        ordered.append(rec)
+    return ordered
+
+
 def assemble_replay(data_dir, cfg, *, since=None, until=None) -> tuple[list[Turn], dict]:
-    """Fold utterance events in `[since, until)` into turns. Does not write anything."""
+    """Fold utterance events in `[since, until)` into turns. Does not write anything.
+
+    Events are ordered by audio start before the fold. Two replays of the same
+    bytes produce the same turns even when a line was appended out of order.
+    """
     asm = TurnAssembler.from_config(cfg)
+    events = list(replay(data_dir, since=since, until=until, types="utterance"))
     turns: list[Turn] = []
-    seen = 0
-    for ev in replay(data_dir, since=since, until=until, types="utterance"):
-        seen += 1
+    for ev in _order_records(events):
         turns.extend(asm.push(ev))
     turns.extend(asm.finish())
+    seen = len(events)
     stats = {
         "turns": len(turns),
         "utterances": sum(len(t.utterance_ids) for t in turns),
@@ -394,73 +477,147 @@ def write_turn_file(path, turns) -> None:
     os.replace(tmp, path)
 
 
-_STOP = object()
+def _cursor_path(data_dir) -> Path:
+    return Path(data_dir) / _CURSOR_NAME
 
 
-def _emit(data_dir, turn: Turn) -> None:
+def _save_cursor(data_dir, offsets: dict[str, int]) -> None:
+    path = _cursor_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"offsets": offsets}, ensure_ascii=False, sort_keys=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_cursor(data_dir) -> dict[str, int]:
+    """Resume offset, or the current end when this stream has no cursor yet.
+
+    The first start snapshots the end and saves it, so history is not backfilled
+    and a crash before the next save still resumes from that end.
+    """
+    path = _cursor_path(data_dir)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            offs = raw.get("offsets") if isinstance(raw, dict) else None
+            if isinstance(offs, dict) and all(
+                    isinstance(k, str) and type(v) is int and v >= 0 for k, v in offs.items()):
+                return dict(offs)
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            log.warning("ignoring unreadable turn cursor %s", path)
+    offsets = snapshot_offsets(data_dir)
+    try:
+        _save_cursor(data_dir, offsets)
+    except OSError:
+        log.exception("turn cursor was not written")
+    return offsets
+
+
+def _emit(data_dir, turn: Turn) -> bool:
+    """Append the turn. False only when the write failed; an id already stored is success."""
     try:
         stored = append(data_dir, turn_event(turn), if_absent=True)
     except Exception:
         log.exception("turn event was not written for %s", turn.utterance_ids[0])
-        return
+        return False
     if stored is not None:
         log.info("[%s] %s", turn.reason, turn.text[:100] or "-")
+    return True
 
 
 def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = None,
           ready: threading.Event | None = None) -> None:
     """Follow new utterance events and emit turns. Blocks until `stop` or Ctrl-C.
 
-    Starts at the current end of the stream, like `audi27 events tail`. Utterances
-    from before this process started are left for `turns replay`.
+    The first start snapshots the end of the stream and does not backfill.
+    Later starts resume from `turns.cursor.json`. Utterances are held until the
+    stream has been idle for `wall_close_s`, then folded in audio-time order, so
+    a segment that lands late is not treated as the next thing that was said.
+    The cursor advances only after that fold, so a crash replays those lines
+    instead of dropping them. Turn ids already in the stream are not written again.
     """
     asm = TurnAssembler.from_config(cfg)
     stop = stop or threading.Event()
-    box: queue.Queue = queue.Queue()
+    offsets = _load_cursor(data_dir)
+    durable = dict(offsets)
+    inbox: list = []
+    last_rx: float | None = None
+    cursor_ok = True
 
-    def pump() -> None:
+    def fold(closing: bool) -> bool:
+        """Apply the held utterances in audio order. `closing` ends the process (`eof`).
+
+        False means a turn was not written. The cursor must stay put so a restart
+        reads those utterances again.
+        """
+        nonlocal inbox, last_rx
+        ordered = _order_records(inbox)
+        inbox = []
+        stamp = last_rx
+        last_rx = None
+        previous = asm._clock
+        # Receipt time, not "now": the idle wait already elapsed, and poll must see it.
+        if stamp is not None and not closing:
+            asm._clock = lambda: stamp
+        ok = True
         try:
-            for ev in follow(data_dir, types="utterance", poll=poll_s, stop=stop, ready=ready):
-                box.put(ev)
-        except Exception:
-            log.exception("turn follower stopped")
+            for ev in ordered:
+                for turn in asm.push(ev):
+                    ok = _emit(data_dir, turn) and ok
+            if closing:
+                closed = asm.finish()
+            elif stamp is not None:
+                closed = asm.poll(time.monotonic())
+            else:
+                closed = []
+            for turn in closed:
+                ok = _emit(data_dir, turn) and ok
         finally:
-            box.put(_STOP)
+            asm._clock = previous
+        return ok
 
-    def flush() -> None:
-        """Apply utterances already queued, then close a leftover turn as eof."""
-        while True:
-            try:
-                queued = box.get_nowait()
-            except queue.Empty:
-                break
-            if queued is _STOP or queued is None:
-                continue
-            for turn in asm.push(queued):
-                _emit(data_dir, turn)
-        for turn in asm.finish():
-            _emit(data_dir, turn)
+    def save(cursor: dict[str, int]) -> None:
+        nonlocal durable
+        if cursor == durable:
+            return
+        try:
+            _save_cursor(data_dir, cursor)
+        except OSError:
+            log.exception("turn cursor was not written")
+            return
+        durable = dict(cursor)
 
     log.info("turn assembler watching %s (gap %.1fs, wall %.1fs, max %.0fs)",
              data_dir, asm.gap_s, asm.wall_close_s, asm.max_duration_s)
-    worker = threading.Thread(target=pump, name="audi27-turns", daemon=True)
-    worker.start()
+    if ready is not None:
+        ready.set()
     try:
-        while True:
-            try:
-                item = box.get(timeout=poll_s)
-            except queue.Empty:
-                item = None
-            if item is _STOP:
-                flush()
-                return
-            if item is not None:
-                for turn in asm.push(item):
-                    _emit(data_dir, turn)
-            for turn in asm.poll():
-                _emit(data_dir, turn)
+        while not stop.is_set():
+            found, offsets = read_new(data_dir, offsets, types="utterance")
+            if found:
+                inbox.extend(found)
+                last_rx = time.monotonic()
+            now = time.monotonic()
+            if inbox and last_rx is not None and now - last_rx >= asm.wall_close_s:
+                cursor_ok = fold(False) and cursor_ok
+                if cursor_ok:
+                    save(offsets)
+            elif not inbox and cursor_ok:
+                # Also move past turn events this process just appended.
+                save(offsets)
+            if stop.wait(poll_s):
+                break
     except KeyboardInterrupt:
         log.info("stopping")
         stop.set()
-        worker.join(timeout=2)
-        flush()
+    finally:
+        try:
+            found, offsets = read_new(data_dir, offsets, types="utterance")
+            if found:
+                inbox.extend(found)
+                last_rx = time.monotonic()
+            if cursor_ok and fold(True):
+                save(offsets)
+        except Exception:
+            log.exception("turn assembler did not flush on the way out")

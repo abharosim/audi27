@@ -19,8 +19,10 @@ from audi27.events import (
     emit,
     follow,
     make_event,
+    read_new,
     ref_chain,
     replay,
+    snapshot_offsets,
     utterance_event,
 )
 from audi27.store import Store
@@ -310,6 +312,29 @@ def test_follow_sees_a_file_created_after_it_starts(tmp_path):
     thread.join(2)
     assert len(list((data / "events").glob("*.jsonl"))) == 2
     assert seen == ["born", "next-day"] and not thread.is_alive()
+
+
+def test_read_new_resumes_after_the_cursor_and_waits_for_a_partial_line(tmp_path):
+    data = tmp_path / "data"
+    emit(data, "utterance", "transcribe", {"text": "old"}, id="old")
+    cursor = snapshot_offsets(data)
+    found, cursor = read_new(data, cursor, types="utterance")
+    assert found == []
+    path = next((data / "events").glob("*.jsonl"))
+    done = make_event("utterance", "transcribe", {"text": "new"}, id="new")
+    raw = (json.dumps(done, ensure_ascii=False) + "\n").encode()
+    with open(path, "ab") as f:
+        f.write(raw[:20])
+    found, mid = read_new(data, cursor, types="utterance")
+    assert found == [] and mid == cursor
+    with open(path, "ab") as f:
+        f.write(raw[20:])
+    # A turn written into the same file must not come back as an utterance, and must not hide `new`.
+    emit(data, "turn", "turns", {"text": "x"}, id="turn-old")
+    found, cursor = read_new(data, mid, types="utterance")
+    assert [ev["id"] for ev in found] == ["new"]
+    found, cursor = read_new(data, cursor, types="utterance")
+    assert found == []
 
 
 def test_replay_since_inclusive_until_exclusive(tmp_path):

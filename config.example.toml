@@ -79,14 +79,14 @@ model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 
 # Group utterances that start with the trigger into one `turn`. Other speech stays ambient.
 # `enabled` also starts `audi27 turns run` under `audi27 supervise` / start.sh. Default off.
-# Match is only at the start of the text. Do not put 大大 in context.md: glossary replacement
-# rewrites the whole sentence, including 大大 in the middle of one.
+# Match is only at the start of the text. 大大小小 / 大大方方 are not the wake word.
+# Do not put 大大 in context.md: glossary replacement rewrites the whole sentence.
 [turns]
 enabled = false
 triggers = ["达达", "哒哒", "大大", "DaDa", "dada", "Dada"]
 gap_s = 2.0             # audio gap (previous end -> next start) that closes a turn; equal still merges
 max_duration_s = 120.0  # cap from the first start to the latest end; longer than one 30s segment
-wall_close_s = 8.0      # live mode: idle time after an utterance is seen, before the turn is closed
+wall_close_s = 8.0      # live mode: idle after the last utterance is seen, then close in audio order
 
 [store]
 data_dir = "data"

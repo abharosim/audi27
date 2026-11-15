@@ -45,6 +45,12 @@ def _asm(**kw):
     ("达达", "", "达达"),
     ("达达……关于面试", "关于面试", "达达"),
     ("dada...next", "next", "dada"),
+    ("\u3000达达，帮我", "帮我", "达达"),
+    ("达达\u3000在吗", "在吗", "达达"),
+    ("\ufeff达达，帮我", "帮我", "达达"),
+    ("\u200b达达", "", "达达"),
+    ("ＤＡＤＡ help", "help", "ＤＡＤＡ"),
+    ("ｄａｄａ，走", "走", "ｄａｄａ"),
 ])
 def test_trigger_variants_and_punctuation(text, rest, surface):
     assert match_trigger(text, TRIGGERS) == surface
@@ -67,6 +73,17 @@ def test_trigger_variants_and_punctuation(text, rest, surface):
     "hello 达达",
     "好的大大",
     "dada's house",
+    "dada\u2019s house",
+    "dada\u2018s house",
+    "dada\uff07s house",
+    "dada２",
+    "dada２go",
+    "ＤＡＤＡｐｉｅ",
+    "大大小小",
+    "大大小小的事情",
+    "大大方方",
+    "大大咧咧地走",
+    "有大大小小的问题",
 ])
 def test_trigger_only_at_the_very_start(text):
     assert match_trigger(text, TRIGGERS) is None
@@ -77,6 +94,18 @@ def test_configured_triggers_replace_the_defaults():
     assert TurnAssembler(triggers=["嘿"]).feed([utt(1, "达达，在吗", 0, 400)]) == []
     turns = TurnAssembler(triggers=["嘿"]).feed([utt(1, "嘿，在吗", 0, 400)])
     assert turns[0].text == "在吗" and turns[0].trigger == "嘿"
+
+
+def test_duplicate_utterance_id_is_kept_once():
+    first = utt(1, "达达，甲", 0, 1000)
+    again = utt(1, "乙", 1200, 1800)
+    turns = _asm().feed([first, again, utt(2, "丙", 2000, 2500)])
+    assert turns[0].utterance_ids == ["u1", "u2"]
+    assert turns[0].text == "甲 丙"
+    asm = _asm()
+    assert asm.push(first) == []
+    assert asm.push(first) == []
+    assert asm.finish()[0].text == "甲"
 
 
 def test_trigger_alone_then_the_command():
@@ -156,6 +185,28 @@ def test_trigger_after_a_long_pause_closes_the_previous_as_gap():
     assert [t.reason for t in turns] == ["gap", "eof"]
     assert turns[0].text == "第一件" and turns[0].utterance_ids == ["u1"]
     assert turns[1].text == "第二件"
+
+
+def test_audio_order_wins_over_arrival_order():
+    """A retried or backfilled segment can land later in the file than it happened."""
+    turns = _asm(gap_s=2).feed([
+        utt(3, "今天天气不错", 8000, 9000),
+        utt(2, "查日程", 1500, 2500),
+        utt(1, "达达，帮我", 0, 1000),
+    ])
+    assert len(turns) == 1
+    assert turns[0].reason == "gap"
+    assert turns[0].utterance_ids == ["u1", "u2"]
+    assert turns[0].text == "帮我 查日程"
+
+    # Earlier ambient speech must not be glued onto the command just because it arrived late.
+    turns = _asm(gap_s=2).feed([
+        utt(1, "达达，帮我", 5000, 6000),
+        utt(2, "今天天气不错", 0, 1000),
+    ])
+    assert turns[0].utterance_ids == ["u1"]
+    assert turns[0].text == "帮我"
+    assert turns[0].reason == "eof"
 
 
 def test_new_trigger_that_is_itself_too_long():
@@ -330,6 +381,29 @@ def test_replay_is_deterministic_and_does_not_touch_the_live_stream(tmp_path):
     assert list(replay(data, types="turn")) == []
 
 
+def _wait_turns(data, n, timeout=3.0):
+    deadline = time.time() + timeout
+    found = []
+    while time.time() < deadline:
+        found = list(replay(data, types="turn"))
+        if len(found) >= n:
+            return found
+        time.sleep(0.05)
+    return found
+
+
+def _serve(data, cfg, wall=0.4):
+    from audi27.turns import serve
+
+    cfg.turns.wall_close_s = wall
+    ready, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=serve, args=(data, cfg), kwargs={"poll_s": 0.05, "stop": stop, "ready": ready}, daemon=True)
+    thread.start()
+    assert ready.wait(2)
+    return thread, stop
+
+
 def test_live_serve_closes_on_the_wall_clock(tmp_path):
     from audi27.turns import serve
 
@@ -357,6 +431,60 @@ def test_live_serve_closes_on_the_wall_clock(tmp_path):
     assert found[0]["data"]["reason"] == "timeout"
     assert found[0]["data"]["text"] == "在吗"
     assert found[0]["ref"] == "u1"
+    assert not thread.is_alive()
+
+
+def test_live_orders_a_late_segment_before_it_closes(tmp_path):
+    from audi27.turns import serve
+
+    data = tmp_path / "data"
+    thread, stop = _serve(data, C.Config(), wall=1.0)
+    # Continuation is written first; the trigger's transcription finishes later.
+    # wall_close_s is long enough that a scheduling gap between these writes
+    # cannot close the batch before the trigger lands.
+    emit_utterance(data, utt(2, "查日程", 1500, 2500))
+    emit_utterance(data, utt(3, "今天天气不错", 8000, 9000))
+    emit_utterance(data, utt(1, "达达，帮我", 0, 1000))
+    found = _wait_turns(data, 1, timeout=4)
+    stop.set()
+    thread.join(2)
+    assert len(found) == 1
+    assert found[0]["data"]["reason"] == "gap"
+    assert found[0]["data"]["utterance_ids"] == ["u1", "u2"]
+    assert found[0]["data"]["text"] == "帮我 查日程"
+    assert not thread.is_alive()
+
+
+def test_restart_does_not_backfill_or_duplicate_and_does_not_drop(tmp_path):
+    from audi27.turns import serve
+
+    data = tmp_path / "data"
+    emit_utterance(data, utt(0, "达达，旧的", 0, 400))
+    thread, stop = _serve(data, C.Config(), wall=0.3)
+    time.sleep(0.8)
+    assert list(replay(data, types="turn")) == []
+    stop.set()
+    thread.join(2)
+    assert not thread.is_alive()
+
+    # Written while the assembler was down: the next process resumes past the snapshot.
+    emit_utterance(data, utt(2, "查日程", 6500, 7500))
+    emit_utterance(data, utt(1, "达达，在吗", 5000, 5400))
+    thread, stop = _serve(data, C.Config(), wall=0.3)
+    found = _wait_turns(data, 1)
+    stop.set()
+    thread.join(2)
+    assert len(found) == 1
+    assert found[0]["id"] == "turn-u1"
+    assert found[0]["data"]["utterance_ids"] == ["u1", "u2"]
+    assert found[0]["data"]["text"] == "在吗 查日程"
+    assert not thread.is_alive()
+
+    thread, stop = _serve(data, C.Config(), wall=0.3)
+    time.sleep(0.8)
+    stop.set()
+    thread.join(2)
+    assert [ev["id"] for ev in replay(data, types="turn")] == ["turn-u1"]
     assert not thread.is_alive()
 
 
