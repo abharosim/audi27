@@ -38,6 +38,9 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 events chain <id>` | 顺着 `ref` 追到起因事件 |
 | `audi27 turns run` | 跟着事件流，把以触发词开头的一轮话写成 `turn` |
 | `audi27 turns replay --since today` | 用历史 utterance 重算 turn，默认只打印 |
+| `audi27 route run` | 跟着 turn，写成 `route`（只显示，不发给 agent） |
+| `audi27 route replay --since today` | 用历史 turn 重算 route，默认只打印 |
+| `audi27 route test "一句话"` | 看这一句会分给谁 |
 | `audi27 eval run <后端>` | 把存下来的录音用另一个后端重跑一遍，结果存到 `data/evals/<标签>.jsonl` |
 | `audi27 eval compare --ref gold` | 以某个标签为参考答案，给其他标签打分 |
 | `audi27 web` | 本地仪表盘 http://127.0.0.1:8727 ：运行状态、实时波形、转写列表 |
@@ -74,6 +77,21 @@ uv run audi27 turns run                           # 常驻写 turn
 ```
 
 `config.toml` 里 `[turns] enabled = true` 时，`./start.sh`（`audi27 supervise`）会把 `turns run` 和录音、仪表盘一起拉起来。默认关着。
+
+## 意图路由
+
+`route` 只读 `turn`，每条写一个 `route`（`id` 为 `route-<turn id>`，`ref` 指向那条 turn）。它不给任何 agent 发消息。仪表盘「路由」页列出最近的结果，✓ / ✗ 记在 `data/route_verdicts.jsonl`，并显示累计准确率。
+
+规则在 `routes.toml`（不存在就用仓库里的 `routes.example.toml`），每条 turn 重新读，改完保存下一条就生效。顺序是：句中点名的 agent（含 Cloud Code、Crowed Code、grog 这类听写）优先，然后整句的队列指令（详细说说 / 跳过 / 稍后 / 还有什么没处理 / 关掉），然后不像指令的整句（算了、不用了），然后关键词（职业规划一类给 Muse），剩下默认 Grok。Claude Code 和本地模型只有被点名才用。`[route] llm = true` 时，没撞上规则的句子才交给纠错用的那个本地模型，超时或答非所问就退回默认；测试可以注入一个假分类器，不需要模型。像发邮件、付款、删除、push、发帖这种句子会标 `needs_confirmation`。
+
+```bash
+uv run audi27 route test "帮我问一下 Muse 下个月面试怎么准备"
+uv run audi27 route replay --since today          # 只打印
+uv run audi27 route replay --since today --json --write
+uv run audi27 route run                           # 常驻写 route
+```
+
+`[route] enabled = true` 时 `./start.sh` 会把 `route run` 也拉起来。默认关着。要有 turn 才有 route，所以一起开 `[turns] enabled`。
 
 ## 换转写后端
 

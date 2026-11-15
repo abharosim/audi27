@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import config as C
 from . import evals as E
+from .route import list_routes, save_route_verdict
 from .status import read_status
 from .store import clean_json, parse_when, search
 from .transcribers import TranscribeError
@@ -157,6 +158,11 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                     self._json(stats)
                 elif url.path == "/api/eval/job":
                     self._json(jobs.snapshot())
+                elif url.path == "/api/routes":
+                    limit = int(q.get("limit", 300))
+                    if limit < 1 or limit > 1000:
+                        raise ValueError("limit must be 1..1000")
+                    self._json(list_routes(root, limit=limit))
                 elif url.path.startswith("/audio/"):
                     self._audio(unquote(url.path[len("/audio/"):]))
                 else:
@@ -196,6 +202,14 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                         raise ValueError(f"unknown backend '{backend}'")
                     label = E._check_label(str(body.get("label") or ("corrected" if backend == CORRECT else backend)))
                     self._json(jobs.start(backend, label, bool(body.get("force"))))
+                elif path == "/api/routes/verdict":
+                    route_id = str(body.get("id") or "")
+                    if body.get("cleared") is True:
+                        self._json(save_route_verdict(root, route_id, cleared=True))
+                    elif not isinstance(body.get("correct"), bool):
+                        raise ValueError("correct must be true or false")
+                    else:
+                        self._json(save_route_verdict(root, route_id, correct=body["correct"]))
                 else:
                     self._json({"error": "not found"}, 404)
             except (ValueError, C.ConfigError) as e:

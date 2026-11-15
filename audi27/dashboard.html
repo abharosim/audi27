@@ -101,6 +101,13 @@
           width: 32px; height: 28px; font-size: 12px; }
   .play:hover { color: var(--text); border-color: #3a4554; }
   .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+  .routes td { vertical-align: top; }
+  .routes .turn { overflow-wrap: anywhere; }
+  .mark { cursor: pointer; border: 1px solid var(--line); background: none; color: var(--dim);
+          border-radius: 8px; width: 28px; height: 26px; font: inherit; font-size: 14px; margin-right: 4px; }
+  .mark.on.yes { color: var(--ok); border-color: #23513f; background: #10261e; }
+  .mark.on.no { color: var(--bad); border-color: #5a2b29; background: #2a1716; }
+  .need { color: var(--warn); font-size: 12px; }
   @media (max-width: 720px) { .tiles { grid-template-columns: repeat(3, 1fr); } .row { grid-template-columns: 70px 1fr auto; } }
   @media (prefers-reduced-motion: reduce) { .pill.on i { animation: none; } }
 </style>
@@ -131,7 +138,14 @@
   <div class="tabs">
     <button class="tab" id="tabT" aria-pressed="true">转写记录</button>
     <button class="tab" id="tabE" aria-pressed="false">模型对比</button>
+    <button class="tab" id="tabR" aria-pressed="false">路由</button>
   </div>
+
+  <section id="viewR" hidden>
+    <p class="hint">只显示，不发给任何 agent。点 ✓ / ✗ 标记这条路由对不对，用来看误分派。</p>
+    <div class="bar"><span class="count" id="routeInfo"></span></div>
+    <div id="routeList"></div>
+  </section>
 
   <section id="viewE" hidden>
     <div class="runbox">
@@ -534,15 +548,82 @@ document.addEventListener('keydown', async ev => {
   }
 });
 
-function showView(evalView) {
-  $('viewE').hidden = !evalView; $('viewT').hidden = evalView;
-  document.querySelector('main').classList.toggle('wide', evalView);
-  $('tabE').setAttribute('aria-pressed', evalView); $('tabT').setAttribute('aria-pressed', !evalView);
-  if (evalView) { loadMatrix(); loadBackends(); pollJob(); }
+const TARGETS = {grok: 'Grok', muse: 'Muse', claude_code: 'Claude Code', local: '本地模型', none: '不分派', queue: '队列'};
+const COMMANDS = {details: '详细说说', skip: '跳过', later: '稍后', pending: '还有什么', close: '关闭'};
+let routeSig = '';
+function routeWhen(ts) {
+  if (!ts || ts.length < 19) return ts || '';
+  return ts.slice(5, 10) + ' ' + ts.slice(11, 19);
 }
-$('tabT').onclick = () => showView(false);
-$('tabE').onclick = () => showView(true);
-if (location.hash === '#eval') showView(true);
+async function markRoute(row, correct) {
+  const body = row.verdict === correct ? {id: row.id, cleared: true} : {id: row.id, correct};
+  const res = await postJSON('/api/routes/verdict', body);
+  if (res.error) { $('routeInfo').textContent = '保存失败：' + res.error; return; }
+  await loadRoutes(true);
+}
+async function loadRoutes(force) {
+  if ($('viewR').hidden) return;
+  let d;
+  try { d = await getJSON('/api/routes'); } catch (e) { return; }
+  if (d.error) { $('routeInfo').textContent = d.error; return; }
+  const acc = d.accuracy || {}, rows = d.routes || [];
+  const accText = acc.judged ? `准确率 ${(acc.rate * 100).toFixed(1)}%（${acc.correct}/${acc.judged}）` : '还没有判定';
+  const sig = accText + '|' + rows.map(r => r.id + ':' + r.verdict + ':' + r.target).join(',');
+  $('routeInfo').textContent = `${rows.length} 条 · ${accText}`;
+  if (!force && sig === routeSig) return;
+  routeSig = sig;
+  const list = $('routeList');
+  list.replaceChildren();
+  if (!rows.length) {
+    list.append(el('div', 'empty', '还没有路由。对达达说一句，turns 和 route 写进事件流后会出现在这里。'));
+    return;
+  }
+  const table = el('table', 'routes'), head = el('tr');
+  ['时间', '原话', '目标', '原因', ''].forEach(t => head.append(el('th', '', t)));
+  table.append(head);
+  for (const r of rows) {
+    const tr = el('tr');
+    tr.append(el('td', 'when', routeWhen(r.ts)));
+    const said = el('td', 'turn');
+    said.append(el('div', '', r.turn_text || '（空）'));
+    if (r.needs_confirmation) said.append(el('div', 'need', '需要确认'));
+    tr.append(said);
+    let target = TARGETS[r.target] || r.target || '';
+    if (r.command) target += ' · ' + (COMMANDS[r.command] || r.command);
+    tr.append(el('td', '', target), el('td', '', r.reason || r.rule || ''));
+    const marks = el('td');
+    const yes = el('button', 'mark yes' + (r.verdict === true ? ' on' : ''), '✓');
+    yes.title = '这条路由是对的'; yes.setAttribute('aria-label', '标记正确');
+    yes.setAttribute('aria-pressed', r.verdict === true ? 'true' : 'false');
+    yes.onclick = () => markRoute(r, true);
+    const no = el('button', 'mark no' + (r.verdict === false ? ' on' : ''), '✗');
+    no.title = '这条路由是错的'; no.setAttribute('aria-label', '标记错误');
+    no.setAttribute('aria-pressed', r.verdict === false ? 'true' : 'false');
+    no.onclick = () => markRoute(r, false);
+    marks.append(yes, no);
+    tr.append(marks);
+    table.append(tr);
+  }
+  list.append(table);
+}
+setInterval(() => loadRoutes(false), 3000);
+
+function showView(name) {
+  $('viewT').hidden = name !== 't';
+  $('viewE').hidden = name !== 'e';
+  $('viewR').hidden = name !== 'r';
+  document.querySelector('main').classList.toggle('wide', name === 'e');
+  $('tabT').setAttribute('aria-pressed', name === 't');
+  $('tabE').setAttribute('aria-pressed', name === 'e');
+  $('tabR').setAttribute('aria-pressed', name === 'r');
+  if (name === 'e') { loadMatrix(); loadBackends(); pollJob(); }
+  if (name === 'r') loadRoutes(true);
+}
+$('tabT').onclick = () => showView('t');
+$('tabE').onclick = () => showView('e');
+$('tabR').onclick = () => showView('r');
+if (location.hash === '#eval') showView('e');
+if (location.hash === '#routes') showView('r');
 
 loadDays().then(() => loadRecords(true));
 setInterval(() => loadRecords(false), 3000);

@@ -88,6 +88,16 @@ gap_s = 2.0             # audio gap (previous end -> next start) that closes a t
 max_duration_s = 120.0  # cap from the first start to the latest end; longer than one 30s segment
 wall_close_s = 8.0      # live mode: idle after the last utterance is seen, then close in audio order
 
+# Intent router. Display only: it writes `route` events and never messages an agent.
+# Rules are routes.toml if that file exists, otherwise routes.example.toml, re-read every turn.
+# `enabled` also starts `audi27 route run` under `audi27 supervise` / start.sh. Default off.
+# Turn events have to exist first, so leave [turns] enabled on as well when you turn this on.
+[route]
+enabled = false
+rules = "routes.toml"
+llm = false             # true: leftovers go to the [correct] local model; timeout or a bad answer uses default
+timeout_s = 8.0
+
 [store]
 data_dir = "data"
 # "all" | "suspect" (only suspect+rejected) | "none". Replay/eval and playback need the audio:

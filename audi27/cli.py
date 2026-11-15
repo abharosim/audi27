@@ -123,7 +123,8 @@ def cmd_supervise(args, cfg) -> int:
     from . import supervisor
 
     _setup_logging(Path(cfg.store.data_dir), args.verbose)
-    supervisor.main(args.config, cfg.store.data_dir, args.host, args.port, turns=cfg.turns.enabled)
+    supervisor.main(args.config, cfg.store.data_dir, args.host, args.port,
+                    turns=cfg.turns.enabled, route=cfg.route.enabled)
     return 0
 
 
@@ -226,6 +227,55 @@ def cmd_turns(args, cfg) -> int:
     return 0
 
 
+def cmd_route(args, cfg) -> int:
+    from .route import (
+        RulesError, decide, format_decision, format_route, get_rules, make_classifier,
+        replay_routes, serve, write_routes,
+    )
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    try:
+        if args.route_cmd == "run":
+            _setup_logging(Path(data_dir), args.verbose)
+
+            def _term(*_):
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, _term)
+            try:
+                serve(data_dir, cfg, poll_s=args.poll)
+            except KeyboardInterrupt:
+                return 0
+            return 0
+        if args.route_cmd == "test":
+            rules = get_rules(cfg.route.rules, strict=True)
+            decision = decide(args.text, rules, classify=make_classifier(cfg), timeout_s=cfg.route.timeout_s)
+            if args.json:
+                print(json.dumps(decision.data(), ensure_ascii=False), flush=True)
+            else:
+                print(format_decision(decision), flush=True)
+            return 0
+        since = parse_when(args.since) if getattr(args, "since", None) else None
+        until = parse_when(args.until, end_of_day=True) if getattr(args, "until", None) else None
+        routes = replay_routes(data_dir, cfg, since=since, until=until)
+        if getattr(args, "write", False):
+            result = write_routes(data_dir, routes)
+            print(f"wrote {result['wrote']}, already present {result['skipped']}", file=sys.stderr)
+        for event in routes:
+            if args.json:
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+            else:
+                print(format_route(event), flush=True)
+        print(f"routes: {len(routes)}", file=sys.stderr)
+    except RulesError as e:
+        print(f"routes: {e}", file=sys.stderr)
+        return 2
+    except ValueError as e:
+        print(f"bad time: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_search(args, cfg) -> int:
     data_dir = args.data_dir or cfg.store.data_dir
     try:
@@ -304,6 +354,21 @@ def main(argv=None) -> int:
     trep.add_argument("--output", help="write turn events as JSONL to this file (replaced each run)")
     trep.add_argument("--write", action="store_true", help="append turn events to the live event stream")
     tp.set_defaults(fn=cmd_turns)
+    rp = sub.add_parser("route", help="route turns to an agent; display only, sends nothing")
+    rsub = rp.add_subparsers(dest="route_cmd", required=True)
+    rrun = rsub.add_parser("run", help="follow turn events and emit route events")
+    rrun.add_argument("--data-dir")
+    rrun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    rrep = rsub.add_parser("replay", help="route stored turns; prints them, does not write the live stream")
+    rrep.add_argument("--data-dir")
+    rrep.add_argument("--since", help="YYYY-MM-DD | ISO datetime | today | yesterday | 30m | 2h | 3d")
+    rrep.add_argument("--until", help="same formats; a bare date includes that whole day")
+    rrep.add_argument("--json", action="store_true", help="one JSON route event per line")
+    rrep.add_argument("--write", action="store_true", help="append route events to the live event stream")
+    rtest = rsub.add_parser("test", help="route one sentence and print the decision")
+    rtest.add_argument("text")
+    rtest.add_argument("--json", action="store_true")
+    rp.set_defaults(fn=cmd_route)
     e = sub.add_parser("eval", help="replay stored audio through other backends and compare")
     e.add_argument("--data-dir")
     esub = e.add_subparsers(dest="eval_cmd", required=True)

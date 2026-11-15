@@ -72,6 +72,15 @@ class StoreCfg:
 
 
 @dataclass
+class RouteCfg:
+    # Live router under `audi27 supervise` only when this is true. `route run` ignores it.
+    enabled: bool = False
+    rules: str = "routes.toml"   # missing file falls back to routes.example.toml; re-read every turn
+    llm: bool = False             # classify leftovers with the [correct] backend; timeout falls back to default
+    timeout_s: float = 8.0
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -91,6 +100,7 @@ class Config:
     store: StoreCfg = field(default_factory=StoreCfg)
     correct: CorrectCfg = field(default_factory=CorrectCfg)
     turns: TurnsCfg = field(default_factory=TurnsCfg)
+    route: RouteCfg = field(default_factory=RouteCfg)
     backend: dict = field(default_factory=dict)  # name -> constructor kwargs
     corrector: dict = field(default_factory=dict)  # name -> constructor kwargs
 
@@ -109,6 +119,7 @@ def load(path: str | Path | None = None) -> Config:
         path = Path("config.toml")
         if not path.exists():
             _check_turns(cfg)
+            _check_route(cfg)
             return cfg
     path = Path(path)
     try:
@@ -133,6 +144,7 @@ def load(path: str | Path | None = None) -> Config:
     if not cfg.transcribe.backends:
         raise ConfigError("transcribe.backends is empty")
     _check_turns(cfg)
+    _check_route(cfg)
     return cfg
 
 
@@ -153,6 +165,22 @@ def _check_turns(cfg: Config) -> None:
         raise ConfigError("turns.gap_s and turns.wall_close_s must be >= 0")
     if t.max_duration_s <= 0:
         raise ConfigError("turns.max_duration_s must be > 0")
+
+
+def _check_route(cfg: Config) -> None:
+    r = cfg.route
+    if not isinstance(r.enabled, bool):
+        raise ConfigError("route.enabled must be true or false")
+    if not isinstance(r.llm, bool):
+        raise ConfigError("route.llm must be true or false")
+    if not isinstance(r.rules, str) or not r.rules.strip():
+        raise ConfigError("route.rules must be a file path, e.g. routes.toml")
+    r.rules = r.rules.strip()
+    if isinstance(r.timeout_s, bool) or not isinstance(r.timeout_s, (int, float)):
+        raise ConfigError("route.timeout_s must be a number")
+    r.timeout_s = float(r.timeout_s)
+    if r.timeout_s <= 0:
+        raise ConfigError("route.timeout_s must be > 0")
 
 
 _FROM_DOTENV: set = set()

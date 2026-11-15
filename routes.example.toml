@@ -1,0 +1,95 @@
+# Routing rules for `audi27 route`. Copy to routes.toml to override; that file is
+# gitignored and wins over this one. The router re-reads the file on every turn.
+#
+# Order, first match wins:
+#   1. an agent name from [agents] anywhere in the turn (explicit naming always wins)
+#   2. a [[queue]] phrase that is the whole turn (fillers like 吧/这个 allowed)
+#   3. a [[whole]] phrase that is the whole turn (不分派)
+#   4. [[keyword]] rules, in the order written here
+#   5. the optional local classifier (config [route] llm), else `default`
+#
+# Claude Code and the local model are not keyword targets. They are used only
+# when a name in [agents] matches, including the ASR spellings from context.md
+# (Cloud Code, Crowed Code, grog, …). A name match allows spaces to be missing,
+# so "cloudcode" still matches "cloud code".
+
+default = "grok"
+
+# Removed from the message together with the agent name, when one of these
+# stands immediately before the name (optionally after 帮我 / 请 / please).
+# Longer phrases are tried first. A verb glued onto another word (使用, 询问)
+# is not treated as 用 / 问 unless that longer form is listed itself.
+address = [
+  "send to",
+  "问一下",
+  "发给",
+  "发到",
+  "请问",
+  "问问",
+  "使用",
+  "帮忙",
+  "tell",
+  "ask",
+  "让",
+  "叫",
+  "找",
+  "用",
+  "问",
+  "给",
+  "请",
+]
+
+# Side-effecting actions. A hit sets needs_confirmation and does not change
+# the target. Latin words use a word boundary, so "poster" is not "post".
+# Bare 推送 is intentionally absent: it is also how notification 推送 is said.
+confirm = [
+  "发邮件", "发送邮件", "发一封邮件", "发个邮件", "send email", "send an email",
+  "付款", "支付", "付钱", "转账", "下单", "购买", "买单", "买",
+  "删除", "删掉", "删了", "delete",
+  "git push", "推代码", "推上去", "推送代码", "push",
+  "发帖", "发推", "发微博", "tweet", "post",
+]
+
+[agents]
+muse = ["muse", "缪斯", "缪思"]
+grok = ["grok", "grog", "grokbot", "grok bot"]
+claude_code = ["claude code", "cloud code", "crowed code"]
+local = ["本地模型", "本地大模型", "本地的模型", "local model", "local llm"]
+
+[[keyword]]
+name = "career"
+target = "muse"
+words = [
+  "职业规划", "职业发展", "职业生涯",
+  "面试", "简历", "跳槽", "求职", "涨薪", "薪资", "晋升",
+  "offer", "career", "resume", "interview",
+]
+
+# The whole turn, not a substring. "算了下个月的账" is still a normal request.
+[[whole]]
+name = "not_a_command"
+target = "none"
+phrases = ["算了", "不用了", "没事了", "没事", "没什么", "不是对你说", "随便说说"]
+
+# Report-queue controls. The turn must be the phrase plus fillers
+# (这个 / 一下 / 吧 / 的 / 吗 …), so "跳过这个文件" and "详细说说职业规划"
+# stay ordinary requests. `command` is the normalized value written on the event.
+[[queue]]
+command = "details"
+phrases = ["详细说说", "详细说", "说详细点", "展开说说", "展开讲讲", "details"]
+
+[[queue]]
+command = "skip"
+phrases = ["跳过", "下一个", "skip"]
+
+[[queue]]
+command = "later"
+phrases = ["稍后", "稍后再说", "等一下", "等会再说", "待会再说", "等会儿", "later"]
+
+[[queue]]
+command = "pending"
+phrases = ["还有什么没处理的", "还有什么没处理", "还有哪些没处理", "还有什么", "pending"]
+
+[[queue]]
+command = "close"
+phrases = ["不用念了", "别说了", "别念了", "停止播报", "关掉", "关闭", "闭嘴", "close"]
