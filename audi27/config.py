@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,18 @@ class FakeCfg:
 
 
 @dataclass
+class GrokbotCfg:
+    # Auth header for the webhook. `{key}` is replaced with AUDI27_GROKBOT_WEBHOOK_KEY.
+    # The URL and the key are environment variables, never keys in this file.
+    header_name: str = "Authorization"
+    header_value: str = "Bearer {key}"
+    timeout_s: float = 10.0
+    context_utterances: int = 0  # last N utterances in the POST; 0 sends none
+    reply_timeout_s: float = 1800.0
+    parse_retries: int = 3  # JSON parse errors before a reply file is quarantined
+
+
+@dataclass
 class QueueCfg:
     # `audi27 supervise` starts `queue run` only when this is true. `queue run` ignores it.
     enabled: bool = False
@@ -146,6 +159,7 @@ class Config:
     route: RouteCfg = field(default_factory=RouteCfg)
     dispatch: DispatchCfg = field(default_factory=DispatchCfg)
     fake: FakeCfg = field(default_factory=FakeCfg)
+    grokbot: GrokbotCfg = field(default_factory=GrokbotCfg)
     queue: QueueCfg = field(default_factory=QueueCfg)
     speak: SpeakCfg = field(default_factory=SpeakCfg)
     presence: PresenceCfg = field(default_factory=PresenceCfg)
@@ -218,6 +232,7 @@ def _check_all(cfg: Config) -> None:
     _check_route(cfg)
     _check_dispatch(cfg)
     _check_fake(cfg)
+    _check_grokbot(cfg)
     _check_queue(cfg)
     _check_speak(cfg)
     _check_presence(cfg)
@@ -272,6 +287,37 @@ def _check_fake(cfg: Config) -> None:
         setattr(f, name, value.strip())
 
 
+_HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+
+def _check_grokbot(cfg: Config) -> None:
+    g = cfg.grokbot
+    if not isinstance(g.header_name, str) or not _HEADER_TOKEN.match(g.header_name):
+        raise ConfigError("grokbot.header_name must be an HTTP header name, e.g. Authorization")
+    if (not isinstance(g.header_value, str) or not g.header_value.strip()
+            or any(c in g.header_value for c in "\r\n")):
+        raise ConfigError("grokbot.header_value must be a header value; {key} is the webhook key")
+    g.header_value = g.header_value.strip()
+    if isinstance(g.timeout_s, bool) or not isinstance(g.timeout_s, (int, float)):
+        raise ConfigError("grokbot.timeout_s must be a number")
+    g.timeout_s = float(g.timeout_s)
+    if g.timeout_s <= 0:
+        raise ConfigError("grokbot.timeout_s must be > 0")
+    if isinstance(g.reply_timeout_s, bool) or not isinstance(g.reply_timeout_s, (int, float)):
+        raise ConfigError("grokbot.reply_timeout_s must be a number")
+    g.reply_timeout_s = float(g.reply_timeout_s)
+    if g.reply_timeout_s <= 0:
+        raise ConfigError("grokbot.reply_timeout_s must be > 0")
+    if isinstance(g.context_utterances, bool) or not isinstance(g.context_utterances, int):
+        raise ConfigError("grokbot.context_utterances must be an integer")
+    if not 0 <= g.context_utterances <= 20:
+        raise ConfigError("grokbot.context_utterances must be from 0 to 20")
+    if isinstance(g.parse_retries, bool) or not isinstance(g.parse_retries, int):
+        raise ConfigError("grokbot.parse_retries must be an integer")
+    if g.parse_retries < 1:
+        raise ConfigError("grokbot.parse_retries must be >= 1")
+
+
 def _check_queue(cfg: Config) -> None:
     q = cfg.queue
     if not isinstance(q.enabled, bool):
@@ -321,8 +367,34 @@ def _check_presence(cfg: Config) -> None:
 _FROM_DOTENV: set = set()
 
 
+def _dotenv_value(raw: str) -> str:
+    """Value of one .env assignment. Quotes and a trailing ` # comment` are not part of it."""
+    value = raw.strip()
+    if value[:1] in "\"'":
+        quote = value[0]
+        i = 1
+        while i < len(value):
+            if value[i] == "\\" and i + 1 < len(value):
+                i += 2
+                continue
+            if value[i] == quote:
+                rest = value[i + 1:].strip()
+                if rest == "" or rest.startswith("#"):
+                    return value[1:i]
+                break
+            i += 1
+        return value
+    cut = value.find(" #")
+    if cut != -1:
+        value = value[:cut].rstrip()
+    return value
+
+
 def load_dotenv(path: Path = Path(".env")) -> None:
-    """KEY=VALUE lines from ./.env into the environment (existing variables win). Keeps API keys out of config.toml."""
+    """KEY=VALUE lines from ./.env into the environment (existing variables win). Keeps API keys out of config.toml.
+
+    A missing file is ignored. `#` comments and optional quotes are stripped; the real environment wins.
+    """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -334,10 +406,8 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
         key = key.strip()
+        value = _dotenv_value(value)
         if key not in os.environ or key in _FROM_DOTENV:  # real environment wins; .env edits are picked up
             os.environ[key] = value
             _FROM_DOTENV.add(key)

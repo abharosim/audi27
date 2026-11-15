@@ -100,7 +100,8 @@ timeout_s = 8.0
 
 # Execution. Off by default: routes are only displayed until this is turned on.
 # `enabled` starts `audi27 dispatch run` from start.sh. Every target uses the
-# fake adapter until a real one is configured. none/queue are never dispatched.
+# fake adapter until a real one is configured. Set grok = "grokbot" to POST
+# that target to Grok Bot (see [grokbot]). none/queue are never dispatched.
 # needs_confirmation writes a task (awaiting_confirmation) and does not call the adapter.
 [dispatch]
 enabled = false
@@ -117,6 +118,21 @@ local = "fake"
 delay_s = 0.0
 fail_marker = "模拟失败"
 decision_marker = "需要你决定"
+
+# Grok Bot webhook. Used only when [dispatch.adapters] grok = "grokbot".
+# The URL and the key are NOT config. Put them in .env (gitignored) or the environment:
+#   AUDI27_GROKBOT_WEBHOOK_URL=https://...
+#   AUDI27_GROKBOT_WEBHOOK_KEY=...
+# header_value may contain {key}, which is replaced with that key.
+# The default header is `Authorization: Bearer <key>`. If Grok Bot expects a
+# different header, change the name and the template here.
+[grokbot]
+header_name = "Authorization"
+header_value = "Bearer {key}"
+timeout_s = 10            # seconds for the POST; one retry, and only on a network error
+context_utterances = 0    # last N utterances included in the POST; 0 sends none. Max 20.
+reply_timeout_s = 1800    # no reply file in this many seconds -> task failed
+parse_retries = 3         # JSON parse errors before a reply file is quarantined
 
 # Report queue. `enabled` starts `audi27 queue run` from start.sh.
 # The first start does not brief history; a restart replays from that point.

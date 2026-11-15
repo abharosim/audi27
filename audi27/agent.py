@@ -1,10 +1,9 @@
-"""Agent adapter contract, and the only adapter implemented so far: `fake`.
+"""Agent adapter contract. `fake` echoes a route; `grokbot` POSTs it to a webhook.
 
-A real adapter (Claude Code next, then Grok, Muse, the local model) implements
-`Agent.handle`. Given one `route` event it emits `task` events and, when the
-work succeeds, one `reply`. It does not read or write the event log; the
-dispatcher does that. `ref` links each event to the one before it, so the reply
-chains back to the route.
+An adapter implements `Agent.handle`. Given one `route` event it emits `task`
+events and, when the work succeeds, one `reply`. It does not read or write the
+event log; the dispatcher does that. `ref` links each event to the one before
+it, so the reply chains back to the route.
 
 `fake` echoes the route text, waits `delay_s` (0 in tests), and can fail or
 ask for a decision when the text contains the configured marker. Nothing here
@@ -55,7 +54,8 @@ def route_target(route: dict) -> str:
     return target if isinstance(target, str) else ""
 
 
-def task_event(route: dict, *, status: str, ref: str, adapter: str | None, error: str | None = None) -> dict:
+def task_event(route: dict, *, status: str, ref: str, adapter: str | None, error: str | None = None,
+               ts=None) -> dict:
     data = {
         "route_id": route["id"],
         "target": route_target(route),
@@ -65,18 +65,18 @@ def task_event(route: dict, *, status: str, ref: str, adapter: str | None, error
     }
     if error:
         data["error"] = error
-    return make_event("task", DISPATCH_SOURCE, data, ts=route.get("ts"), ref=ref,
+    return make_event("task", DISPATCH_SOURCE, data, ts=route.get("ts") if ts is None else ts, ref=ref,
                       id=f"task-{route['id']}-{status}")
 
 
-def reply_event(route: dict, *, ref: str, text: str, needs_decision: bool, adapter: str) -> dict:
+def reply_event(route: dict, *, ref: str, text: str, needs_decision: bool, adapter: str, ts=None) -> dict:
     return make_event("reply", DISPATCH_SOURCE, {
         "route_id": route["id"],
         "target": route_target(route),
         "adapter": adapter,
         "text": text,
         "needs_decision": needs_decision,
-    }, ts=route.get("ts"), ref=ref, id=f"reply-{route['id']}")
+    }, ts=route.get("ts") if ts is None else ts, ref=ref, id=f"reply-{route['id']}")
 
 
 def _marked(text: str, marker: str) -> bool:
@@ -128,11 +128,14 @@ class FakeAgent(Agent):
 def build_agent(name: str, cfg) -> Agent | None:
     """The adapter named in config, or None when this build does not know it.
 
-    Only `fake` exists. Claude Code and the others will be added behind this
-    same function; callers already treat None as "emit a failed task".
+    `fake` is the default. `grokbot` is the webhook adapter, used only when a
+    target names it. Callers already treat None as "emit a failed task".
     """
-    if name != "fake":
-        return None
-    fake = cfg.fake
-    return FakeAgent(delay_s=fake.delay_s, fail_marker=fake.fail_marker,
-                     decision_marker=fake.decision_marker)
+    if name == "fake":
+        fake = cfg.fake
+        return FakeAgent(delay_s=fake.delay_s, fail_marker=fake.fail_marker,
+                         decision_marker=fake.decision_marker)
+    if name == "grokbot":
+        from .grokbot import GrokbotAgent
+        return GrokbotAgent.from_cfg(cfg)
+    return None

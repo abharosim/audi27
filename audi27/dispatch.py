@@ -99,17 +99,32 @@ def _note(state: dict, event: dict) -> None:
         state[route_id] = status
 
 
+def _grokbot_routes(data_dir) -> set[str]:
+    """Routes already handed to Grok Bot. The reply arrives as a file, so a restart waits."""
+    found = set()
+    for ev in replay(data_dir, types="task"):
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if data.get("adapter") == "grokbot" and isinstance(data.get("route_id"), str):
+            found.add(data["route_id"])
+    return found
+
+
 def close_interrupted(data_dir, emit, state: dict) -> None:
     """Write one `failed` task for every route an adapter already took and did not finish.
 
     Does not call the adapter. A restart must not send the same work again.
+    A grokbot route is left alone: the inbox watcher owns its timeout, and a
+    late reply file is still applied. It is not sent a second time.
     """
     routes = {}
     for ev in replay(data_dir, types="route"):
         if isinstance(ev.get("id"), str):
             routes[ev["id"]] = ev
+    waiting = _grokbot_routes(data_dir)
     for route_id, status in list(state.items()):
         if status not in _HANDED:
+            continue
+        if route_id in waiting:
             continue
         route = routes.get(route_id)
         if route is None:
@@ -118,7 +133,7 @@ def close_interrupted(data_dir, emit, state: dict) -> None:
         state[route_id] = "failed"
 
 
-def dispatch_one(route: dict, cfg, emit, *, agents: dict | None = None) -> None:
+def dispatch_one(route: dict, cfg, emit, *, agents: dict | None = None, data_dir=None) -> None:
     """Emit the events for one route. `emit` may be called zero times.
 
     `agents` maps an adapter name to an `Agent`. Tests pass this; the live
@@ -139,10 +154,12 @@ def dispatch_one(route: dict, cfg, emit, *, agents: dict | None = None) -> None:
         emit(task_event(route, status="failed", ref=route["id"], adapter=name,
                         error=f"没有适配器 {name}"))
         return
+    if data_dir is not None and hasattr(agent, "data_dir"):
+        agent.data_dir = str(data_dir)
     agent.handle(route, emit)
 
 
-def _invoke(route: dict, cfg, emit, agents, state: dict) -> None:
+def _invoke(route: dict, cfg, emit, agents, state: dict, data_dir=None) -> None:
     """Hand `route` to an adapter at most once. `emit` records into `state`.
 
     `OSError` propagates so the caller can leave the cursor and retry the
@@ -157,7 +174,7 @@ def _invoke(route: dict, cfg, emit, agents, state: dict) -> None:
         state[route_id] = "silent"
         return
     try:
-        dispatch_one(route, cfg, emit, agents=agents)
+        dispatch_one(route, cfg, emit, agents=agents, data_dir=data_dir)
     except OSError:
         raise
     except Exception:
@@ -192,7 +209,7 @@ def dispatch_all(data_dir, cfg, *, agents: dict | None = None) -> dict:
 
     close_interrupted(data_dir, emit, state)
     for route in replay(data_dir, types="route"):
-        _invoke(route, cfg, emit, agents, state)
+        _invoke(route, cfg, emit, agents, state, data_dir)
     return {"wrote": wrote}
 
 
@@ -236,7 +253,7 @@ def _process(data_dir, route: dict, cfg, agents, state: dict) -> bool:
         _note(state, event)
 
     try:
-        _invoke(route, cfg, emit, agents, state)
+        _invoke(route, cfg, emit, agents, state, data_dir)
     except OSError:
         log.exception("dispatch event was not written for %s", route.get("id"))
         return False
@@ -259,7 +276,20 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
         append(data_dir, event, if_absent=True)
         _note(state, event)
 
+    def grokbot_tick() -> None:
+        # Reply files and the reply timeout live with the dispatcher so
+        # start.sh does not grow another process. A failure here must not
+        # stop route delivery.
+        try:
+            from .grokbot import tick as grokbot_tick
+            grokbot_tick(data_dir, cfg, emit)
+        except OSError:
+            log.exception("grokbot inbox was not processed")
+        except Exception:
+            log.exception("grokbot inbox failed")
+
     try:
+        grokbot_tick()  # a reply that landed while we were down, before other adapters are closed
         close_interrupted(data_dir, emit, state)
     except OSError:
         log.exception("could not close an interrupted route")
@@ -284,6 +314,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
             found, offsets = read_new(data_dir, offsets, types="route")
             for event in found:
                 cursor_ok = _process(data_dir, event, cfg, agents, state) and cursor_ok
+            grokbot_tick()
             if cursor_ok:
                 save(offsets)
             if stop.wait(poll_s):
@@ -296,6 +327,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
             found, offsets = read_new(data_dir, offsets, types="route")
             for event in found:
                 cursor_ok = _process(data_dir, event, cfg, agents, state) and cursor_ok
+            grokbot_tick()
             if cursor_ok:
                 save(offsets)
         except Exception:

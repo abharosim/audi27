@@ -295,6 +295,46 @@ def cmd_dispatch(args, cfg) -> int:
     return 0
 
 
+def cmd_grokbot(args, cfg) -> int:
+    from .grokbot import WebhookError, post_webhook, serve_inbox
+
+    if args.grokbot_cmd == "test":
+        url = os.environ.get("AUDI27_GROKBOT_WEBHOOK_URL", "").strip()
+        key = os.environ.get("AUDI27_GROKBOT_WEBHOOK_KEY", "").strip()
+        if not url or not key:
+            print("error: set AUDI27_GROKBOT_WEBHOOK_URL and AUDI27_GROKBOT_WEBHOOK_KEY", file=sys.stderr)
+            return 2
+        payload = {
+            "task_id": "test",
+            "route_id": "test",
+            "text": args.text,
+            "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        }
+        try:
+            status, _body = post_webhook(
+                url, payload, header_name=cfg.grokbot.header_name,
+                header_value=cfg.grokbot.header_value, key=key, timeout_s=cfg.grokbot.timeout_s)
+        except WebhookError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(status)
+        return 0 if 200 <= status < 300 else 1
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    cfg.store.data_dir = str(data_dir)
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve_inbox(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_queue(args, cfg) -> int:
     from .queue import format_queue, load_state, serve
 
@@ -435,6 +475,14 @@ def main(argv=None) -> int:
     drun.add_argument("--data-dir")
     drun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
     dp.set_defaults(fn=cmd_dispatch)
+    gp = sub.add_parser("grokbot", help="Grok Bot webhook: send one test POST, or watch reply files")
+    gsub = gp.add_subparsers(dest="grokbot_cmd", required=True)
+    gtest = gsub.add_parser("test", help="POST one line to the Grok Bot webhook and print the HTTP status")
+    gtest.add_argument("text")
+    gin = gsub.add_parser("inbox", help="watch data/inbox/grokbot for reply files and emit reply events")
+    gin.add_argument("--data-dir")
+    gin.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    gp.set_defaults(fn=cmd_grokbot)
     qp = sub.add_parser("queue", help="turn replies into briefs and apply queue commands")
     qsub = qp.add_subparsers(dest="queue_cmd", required=True)
     qrun = qsub.add_parser("run", help="follow the event stream and emit brief events")
