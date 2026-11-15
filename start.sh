@@ -4,6 +4,8 @@
 # With `[route] enabled = true`, the router is started too (it only displays; it sends nothing).
 # `[dispatch] enabled`, `[queue] enabled`, and `[speak] enabled` start those processes.
 # All three default off: routes stay on screen until execution is turned on.
+# `[presence] enabled` (default off) does not start a process. The recorder, which
+# already has the frames, publishes data/presence.json only when that flag is on.
 # To restart after a code change without touching this terminal:  touch data/restart.request
 set -e
 cd "$(dirname "$0")"

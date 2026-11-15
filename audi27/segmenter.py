@@ -37,6 +37,9 @@ class Segmenter:
         self.pre = deque(maxlen=max(self.start_frames, round(cfg.pre_roll_ms / frame_ms)))
         self.floor: float | None = None
         self.dropped_short = 0
+        # Latest frame's energy decision, independent of whether a segment is open.
+        # Presence reads this; it is not cleared when a segment is emitted.
+        self.last_speech = False
         self._reset()
 
     def _reset(self) -> None:
@@ -60,6 +63,7 @@ class Segmenter:
     def feed(self, frame: np.ndarray, ts: float) -> Segment | None:
         """Feed one frame (int16) whose first sample was captured at `ts`."""
         speech = self._is_speech(frame_db(frame))
+        self.last_speech = bool(speech)
         if not self.active:
             self.pre.append(frame)
             self.run = self.run + 1 if speech else 0
