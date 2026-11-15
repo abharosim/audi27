@@ -185,6 +185,15 @@ class ScreenCfg:
 
 
 @dataclass
+class CueCfg:
+    # `audi27 supervise` starts `cue run` only when this is true. Default off,
+    # same as the other live loops. `cue run` itself still plays. The file does
+    # not have to exist at load time: a missing sound is logged when a turn arrives.
+    enabled: bool = False
+    sound: str = "/System/Library/Sounds/Tink.aiff"
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -204,6 +213,7 @@ class Config:
     store: StoreCfg = field(default_factory=StoreCfg)
     correct: CorrectCfg = field(default_factory=CorrectCfg)
     turns: TurnsCfg = field(default_factory=TurnsCfg)
+    cue: CueCfg = field(default_factory=CueCfg)
     route: RouteCfg = field(default_factory=RouteCfg)
     dispatch: DispatchCfg = field(default_factory=DispatchCfg)
     fake: FakeCfg = field(default_factory=FakeCfg)
@@ -279,6 +289,7 @@ def _check_turns(cfg: Config) -> None:
 
 def _check_all(cfg: Config) -> None:
     _check_turns(cfg)
+    _check_cue(cfg)
     _check_route(cfg)
     _check_dispatch(cfg)
     _check_fake(cfg)
@@ -288,6 +299,15 @@ def _check_all(cfg: Config) -> None:
     _check_speak(cfg)
     _check_presence(cfg)
     _check_screen(cfg)
+
+
+def _check_cue(cfg: Config) -> None:
+    c = cfg.cue
+    if not isinstance(c.enabled, bool):
+        raise ConfigError("cue.enabled must be true or false")
+    if not isinstance(c.sound, str) or not c.sound.strip():
+        raise ConfigError("cue.sound must be a file path, e.g. /System/Library/Sounds/Tink.aiff")
+    c.sound = c.sound.strip()
 
 
 def _check_route(cfg: Config) -> None:

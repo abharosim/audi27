@@ -127,7 +127,7 @@ def cmd_supervise(args, cfg) -> int:
                     turns=cfg.turns.enabled, route=cfg.route.enabled,
                     dispatch=cfg.dispatch.enabled, queue=cfg.queue.enabled,
                     speak=cfg.speak.enabled, confirm=cfg.confirm.enabled,
-                    screen=cfg.screen.enabled)
+                    screen=cfg.screen.enabled, cue=cfg.cue.enabled)
     return 0
 
 
@@ -394,6 +394,27 @@ def cmd_speak(args, cfg) -> int:
     return 0
 
 
+def cmd_cue(args, cfg) -> int:
+    from .cue import play_once, serve
+
+    if args.cue_cmd == "test":
+        result = play_once(cfg)
+        print(f"{result.get('backend', 'log')}: {result.get('sound', '')}", flush=True)
+        return 0
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    _setup_logging(Path(data_dir), args.verbose)
+
+    def _term(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        serve(data_dir, cfg, poll_s=args.poll)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def cmd_screen(args, cfg) -> int:
     from .screen import serve
 
@@ -543,6 +564,13 @@ def main(argv=None) -> int:
     stest = ssub.add_parser("test", help="speak one line and print what the backend did")
     stest.add_argument("text")
     sp.set_defaults(fn=cmd_speak)
+    cu = sub.add_parser("cue", help="play a short sound when a wake word is heard")
+    cusub = cu.add_subparsers(dest="cue_cmd", required=True)
+    cusub.add_parser("test", help="play the configured sound once and print what happened")
+    crun = cusub.add_parser("run", help="follow utterances and play the cue when a trigger opens a turn")
+    crun.add_argument("--data-dir")
+    crun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
+    cu.set_defaults(fn=cmd_cue)
     sc = sub.add_parser("screen", help="record the frontmost app and window title")
     scsub = sc.add_subparsers(dest="screen_cmd", required=True)
     scrun = scsub.add_parser("run", help="sample the front window and emit screen events on change")

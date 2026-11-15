@@ -88,6 +88,22 @@ gap_s = 2.0             # audio gap (previous end -> next start) that closes a t
 max_duration_s = 120.0  # cap from the first start to the latest end; longer than one 30s segment
 wall_close_s = 8.0      # live mode: idle after the last utterance is seen, then close in audio order
 
+# Short local sound as soon as a wake word is heard, before the turn closes
+# (does not wait for wall_close_s) and before route or dispatch.
+# Default off, same as the other live loops. It watches utterances and plays
+# when one would open a turn: status ok/suspect and the text starts with a
+# [turns] trigger (your list, including homophones such as 答答). `audi27
+# supervise` / start.sh starts `audi27 cue run` when this flag is true. Running
+# `audi27 cue run` by hand plays even when the flag is false. `audi27 cue test`
+# plays the sound once and writes no event.
+# macOS uses `afplay` for at most one second (Tink is already shorter). A missing
+# file, a missing `afplay`, or any other OS is logged and does not stop the
+# process. A bare yes/no that the mic picks up during that playback, or in the
+# short tail after it, is ignored the same way as a TTS read-back.
+[cue]
+enabled = false
+sound = "/System/Library/Sounds/Tink.aiff"
+
 # Intent router. Display only: it writes `route` events and never messages an agent.
 # Rules are routes.toml if that file exists, otherwise routes.example.toml, re-read every turn.
 # `enabled` also starts `audi27 route run` under `audi27 supervise` / start.sh. Default off.
