@@ -9,8 +9,8 @@
 # `[confirm] enabled` (default off) starts `audi27 confirm run`.
 # `[screen] enabled` (default off) starts `audi27 screen run`. It records only the
 # frontmost app and the front window title, and only on macOS.
-# `[cue] enabled` (default off) starts `audi27 cue run`: a short sound when a
-# wake-word turn is detected, before route or dispatch.
+# `[cue] enabled` (default off) starts `audi27 cue run`: a short sound as soon as
+# a wake word is heard, before the turn closes and before route or dispatch.
 # To restart after a code change without touching this terminal:  touch data/restart.request
 set -e
 cd "$(dirname "$0")"

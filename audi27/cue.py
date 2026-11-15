@@ -1,16 +1,17 @@
-"""Play a short local sound when a wake-word turn is detected.
+"""Play a short local sound when a wake word is heard.
 
-This watches `turn` events and does not import the router or the dispatcher.
-The sound starts before either of those has done any remote work. Playback is
-a separate process (`afplay` on macOS, at most one second) and this loop does
-not wait for it, so a missing player cannot stall transcription or dispatch.
+This watches `utterance` events and does not import the router, the dispatcher,
+or the recorder. An `ok` or `suspect` line that starts with a `[turns]` trigger
+opens a turn, so the sound starts then — not after `wall_close_s`, and before
+route or dispatch. Playback is a separate process (`afplay` on macOS, at most
+one second) and this loop does not wait for it.
 
 A missing file, a missing `afplay`, or any other OS is logged. The process
-keeps running. A successful play appends `cue_played` (`ref` = the turn id).
-That window is the same kind of self-speech as a TTS read-back: a bare yes/no
-whose audio starts inside it is ignored. The first start does not replay
-history (`data/cue.cursor.json`). `[cue] enabled` only decides whether
-`audi27 supervise` starts this loop; `cue run` plays either way.
+keeps running. A play appends `cue_played` (`ref` = the utterance id). That
+window is the same kind of self-speech as a TTS read-back: a bare yes/no whose
+audio starts inside it is ignored. The first start does not replay history
+(`data/cue.cursor.json`). `[cue] enabled` only decides whether `audi27 supervise`
+starts this loop; `cue run` plays either way.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .events import append, make_event, read_new, replay, snapshot_offsets
+from .turns import match_trigger
 
 log = logging.getLogger("audi27.cue")
 
@@ -135,10 +137,24 @@ def playback_windows(events) -> list[tuple[datetime, datetime]]:
     return windows
 
 
-def _trigger(turn: dict) -> str:
-    data = turn.get("data") if isinstance(turn.get("data"), dict) else {}
-    trig = data.get("trigger")
-    return trig if isinstance(trig, str) else ""
+def wake_trigger(event: dict, triggers) -> str | None:
+    """Surface form when `event` would open a turn, otherwise None.
+
+    Same gate as the turn assembler: status `ok` or `suspect`, non-blank text,
+    and `match_trigger` against the configured list (not the built-in defaults).
+    """
+    if not isinstance(event, dict) or event.get("type") != "utterance":
+        return None
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    if data.get("status") not in ("ok", "suspect"):
+        return None
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    ident = event.get("id")
+    if not isinstance(ident, str) or not ident or any(c.isspace() for c in ident):
+        return None
+    return match_trigger(text, triggers)
 
 
 def _outcome(player, sound: str) -> dict:
@@ -163,17 +179,35 @@ def _already(data_dir, ident: str) -> bool:
     return False
 
 
-def ack(data_dir, cfg, turn: dict, *, player) -> bool:
-    """Play the cue for one turn and append `cue_played`.
-
-    False only when that event could not be written, so the caller keeps the
-    cursor and tries this turn again. An id already stored is not played again.
-    """
-    turn_id = turn.get("id")
-    if not isinstance(turn_id, str) or not turn_id or any(c.isspace() for c in turn_id):
-        log.warning("cue: ignoring a turn with no id")
+def _flush(data_dir, pending: dict, ident: str) -> bool:
+    """Write a cue that was already played. False leaves it pending for the next poll."""
+    event = pending.get(ident)
+    if event is None:
         return True
-    ident = "cue-" + turn_id
+    try:
+        append(data_dir, event, if_absent=True)
+    except OSError:
+        log.exception("cue event was not written for %s", event.get("ref"))
+        return False
+    pending.pop(ident, None)
+    return True
+
+
+def ack(data_dir, cfg, utterance: dict, *, player, pending: dict) -> bool:
+    """Play the cue for one wake utterance and append `cue_played`.
+
+    False only when that event still needs to be written, so the cursor stays
+    and the next poll tries the write again. The sound is not played twice:
+    `pending` remembers an id whose append failed. An id already stored is
+    not played again. Anything that would not open a turn is ignored.
+    """
+    trigger = wake_trigger(utterance, cfg.turns.triggers)
+    if trigger is None:
+        return True
+    utt_id = utterance["id"]
+    ident = "cue-" + utt_id
+    if ident in pending:
+        return _flush(data_dir, pending, ident)
     if _already(data_dir, ident):
         return True
     sound = cfg.cue.sound
@@ -184,25 +218,22 @@ def ack(data_dir, cfg, turn: dict, *, player) -> bool:
         "sound": sound,
         "backend": result["backend"],
         "ok": result["ok"],
-        "trigger": _trigger(turn),
+        "trigger": trigger,
     }
     if result["ok"]:
         data["until"] = (started + timedelta(seconds=SUPPRESS_S)).isoformat(timespec="milliseconds")
     try:
-        event = make_event("cue_played", CUE_SOURCE, data, ts=started, ref=turn_id, id=ident)
+        event = make_event("cue_played", CUE_SOURCE, data, ts=started, ref=utt_id, id=ident)
     except Exception:
-        log.exception("cue event was not built for %s", turn_id)
+        log.exception("cue event was not built for %s", utt_id)
         return True
-    try:
-        append(data_dir, event, if_absent=True)
-    except OSError:
-        log.exception("cue event was not written for %s", turn_id)
-        return False
+    # Remember the play before the append. A failed write must not ding again.
+    pending[ident] = event
     if result["ok"]:
-        log.info("cue played for %s", turn_id)
+        log.info("cue played for %s", utt_id)
     else:
-        log.info("cue not played for %s", turn_id)
-    return True
+        log.info("cue not played for %s", utt_id)
+    return _flush(data_dir, pending, ident)
 
 
 def play_once(cfg, *, player=None) -> dict:
@@ -245,15 +276,16 @@ def _load_cursor(data_dir) -> dict:
 
 def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = None,
           ready: threading.Event | None = None, player=None) -> None:
-    """Play a cue for each new turn. The first start does not read history.
+    """Play a cue for each new wake-word utterance. The first start does not read history.
 
-    Blocks until `stop`. A turn whose `cue_played` event was not written is
-    read again after the next poll.
+    Blocks until `stop`. An utterance whose `cue_played` event was not written
+    is read again after the next poll; the sound is not played a second time.
     """
     player = build_player() if player is None else player
     stop = stop or threading.Event()
     offsets = _load_cursor(data_dir)
     durable = dict(offsets)
+    pending: dict = {}
 
     def save(cursor: dict) -> None:
         nonlocal durable
@@ -268,8 +300,8 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
 
     def cue_new(found) -> bool:
         ok = True
-        for turn in found:
-            if not ack(data_dir, cfg, turn, player=player):
+        for utterance in found:
+            if not ack(data_dir, cfg, utterance, player=player, pending=pending):
                 ok = False
         return ok
 
@@ -278,13 +310,13 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
         ready.set()
     try:
         while not stop.is_set():
-            pending = offsets
-            found, offsets = read_new(data_dir, offsets, types="turn")
+            held = offsets
+            found, offsets = read_new(data_dir, offsets, types="utterance")
             if found:
                 if cue_new(found):
                     save(offsets)
                 else:
-                    offsets = pending
+                    offsets = held
             elif offsets != durable:
                 save(offsets)
             if stop.wait(poll_s):
@@ -294,7 +326,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
         stop.set()
     finally:
         try:
-            found, offsets = read_new(data_dir, offsets, types="turn")
+            found, offsets = read_new(data_dir, offsets, types="utterance")
             if found and cue_new(found):
                 save(offsets)
         except Exception:

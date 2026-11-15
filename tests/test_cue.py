@@ -1,4 +1,4 @@
-"""Wake-word cue: a short local sound when a turn is detected, before any agent runs.
+"""Wake-word cue: a short local sound when the wake word is heard, before any agent runs.
 
 The player is injected. Nothing here opens a sound device.
 """
@@ -29,9 +29,9 @@ def turn(ident="turn-1", trigger="达达", text="查天气", start=TS):
     }, ts=start, ref=ident + "-u", id=ident)
 
 
-def utterance(ident, text, start):
+def utterance(ident, text, start, *, status="ok"):
     return make_event("utterance", "transcribe", {
-        "id": ident, "text": text, "status": "ok", "start": start, "end": start,
+        "id": ident, "text": text, "status": status, "start": start, "end": start,
     }, ts=start, id=ident)
 
 
@@ -153,11 +153,35 @@ def test_a_late_afplay_failure_is_logged_and_does_not_raise(caplog):
 # --- events ------------------------------------------------------------------
 
 
-def test_a_new_turn_plays_once_and_records_cue_played(tmp_path):
-    from audi27.cue import SUPPRESS_S, serve
+def _serve(data, cfg, player):
+    from audi27.cue import serve
+
+    ready, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=serve, args=(data, cfg),
+        kwargs={"poll_s": 0.05, "stop": stop, "ready": ready, "player": player},
+        daemon=True)
+    thread.start()
+    assert ready.wait(2)
+    return thread, stop
+
+
+def _wait_cues(data, n, timeout=3):
+    deadline = time.time() + timeout
+    found = []
+    while time.time() < deadline:
+        found = list(replay(data, types="cue_played"))
+        if len(found) >= n:
+            break
+        time.sleep(0.05)
+    return found
+
+
+def test_a_wake_utterance_dings_and_a_continuation_does_not(tmp_path):
+    from audi27.cue import SUPPRESS_S
 
     data = tmp_path / "data"
-    append(data, turn("turn-old"))
+    append(data, utterance("u-old", "达达，旧的", TS))
     calls = []
 
     def player(sound):
@@ -166,62 +190,68 @@ def test_a_new_turn_plays_once_and_records_cue_played(tmp_path):
 
     cfg = C.Config()
     cfg.cue.sound = SOUND
-    ready, stop = threading.Event(), threading.Event()
-    thread = threading.Thread(
-        target=serve, args=(data, cfg),
-        kwargs={"poll_s": 0.05, "stop": stop, "ready": ready, "player": player},
-        daemon=True)
-    thread.start()
-    assert ready.wait(2)
+    cfg.turns.triggers = ["达达", "答答", "搭搭"]
+    thread, stop = _serve(data, cfg, player)
     time.sleep(0.2)
     assert calls == [] and list(replay(data, types="cue_played")) == []
 
-    append(data, turn("turn-new", text="今天天气"))
-    deadline = time.time() + 3
-    found = []
-    while time.time() < deadline:
-        found = list(replay(data, types="cue_played"))
-        if found:
-            break
-        time.sleep(0.05)
+    append(data, utterance("u-wake", "达达，今天天气", "2026-11-15T12:00:01+00:00"))
+    append(data, utterance("u-more", "明天下雨", "2026-11-15T12:00:02+00:00"))
+    append(data, utterance("u-reject", "达达，噪声", "2026-11-15T12:00:03+00:00", status="rejected"))
+    append(data, utterance("u-blank", "   ", "2026-11-15T12:00:04+00:00"))
+    append(data, utterance("u-suspect", "答答？", "2026-11-15T12:00:05+00:00", status="suspect"))
+    append(data, turn("turn-late", text="这条 turn 不该再响"))
+    found = _wait_cues(data, 2)
+    time.sleep(0.25)
     stop.set()
     thread.join(2)
-    assert calls == [SOUND]
-    assert len(found) == 1
-    ev = found[0]
-    assert ev["type"] == "cue_played" and ev["source"] == "cue" and ev["ref"] == "turn-new"
-    assert ev["id"] == "cue-turn-new"
-    assert ev["data"]["ok"] is True and ev["data"]["backend"] == "mock"
-    assert ev["data"]["sound"] == SOUND and ev["data"]["trigger"] == "达达"
-    delta = datetime.fromisoformat(ev["data"]["until"]) - datetime.fromisoformat(ev["ts"])
+    assert calls == [SOUND, SOUND]
+    assert [ev["id"] for ev in found] == ["cue-u-wake", "cue-u-suspect"]
+    assert [ev["ref"] for ev in found] == ["u-wake", "u-suspect"]
+    assert found[0]["data"]["trigger"] == "达达" and found[1]["data"]["trigger"] == "答答"
+    assert found[0]["data"]["ok"] is True and found[0]["data"]["backend"] == "mock"
+    assert found[0]["data"]["sound"] == SOUND
+    delta = datetime.fromisoformat(found[0]["data"]["until"]) - datetime.fromisoformat(found[0]["ts"])
     assert abs(delta.total_seconds() - SUPPRESS_S) < 0.05
     assert "cue_played" in KNOWN_TYPES
     assert not thread.is_alive()
 
-    # Rewinding the cursor replays turns that never got a cue, and skips one that did.
+    # A rewound cursor plays the pre-start line (it never got a cue) and skips the ones that did.
     offs = {name: 0 for name in snapshot_offsets(data)}
     (data / "cue.cursor.json").write_text(json.dumps({"offsets": offs}), encoding="utf-8")
-    ready2, stop2 = threading.Event(), threading.Event()
-    again = threading.Thread(
-        target=serve, args=(data, cfg),
-        kwargs={"poll_s": 0.05, "stop": stop2, "ready": ready2, "player": player},
-        daemon=True)
-    again.start()
-    assert ready2.wait(2)
-    deadline = time.time() + 3
-    while time.time() < deadline and len(calls) < 2:
-        time.sleep(0.05)
+    again, stop2 = _serve(data, cfg, player)
+    _wait_cues(data, 3)
     time.sleep(0.2)
     stop2.set()
     again.join(2)
+    assert calls == [SOUND, SOUND, SOUND]
+    assert [ev["id"] for ev in replay(data, types="cue_played")] == [
+        "cue-u-wake", "cue-u-suspect", "cue-u-old",
+    ]
+
+
+def test_a_second_trigger_dings_again(tmp_path):
+    data = tmp_path / "data"
+    calls = []
+
+    def player(sound):
+        calls.append(sound)
+        return {"ok": True, "backend": "mock", "sound": sound}
+
+    cfg = C.Config()
+    thread, stop = _serve(data, cfg, player)
+    append(data, utterance("u1", "达达，第一件", TS))
+    append(data, utterance("u2", "继续说", "2026-11-15T12:00:01+00:00"))
+    append(data, utterance("u3", "dada, next", "2026-11-15T12:00:02+00:00"))
+    found = _wait_cues(data, 2)
+    stop.set()
+    thread.join(2)
     assert calls == [SOUND, SOUND]
-    assert sorted(ev["id"] for ev in replay(data, types="cue_played")) == ["cue-turn-new", "cue-turn-old"]
-    assert not again.is_alive()
+    assert [ev["ref"] for ev in found] == ["u1", "u3"]
+    assert [ev["data"]["trigger"] for ev in found] == ["达达", "dada"]
 
 
-def test_a_player_exception_still_acks_the_turn_and_the_next_one(tmp_path, caplog):
-    from audi27.cue import serve
-
+def test_a_player_exception_still_acks_the_utterance_and_the_next_one(tmp_path, caplog):
     data = tmp_path / "data"
     calls = []
 
@@ -232,32 +262,69 @@ def test_a_player_exception_still_acks_the_turn_and_the_next_one(tmp_path, caplo
         return {"ok": True, "backend": "mock", "sound": sound}
 
     caplog.set_level(logging.ERROR)
-    ready, stop = threading.Event(), threading.Event()
-    thread = threading.Thread(
-        target=serve, args=(data, C.Config()),
-        kwargs={"poll_s": 0.05, "stop": stop, "ready": ready, "player": player},
-        daemon=True)
-    thread.start()
-    assert ready.wait(2)
-    append(data, turn("turn-a"))
-    append(data, turn("turn-b", text="第二句"))
+    thread, stop = _serve(data, C.Config(), player)
+    append(data, utterance("u-a", "达达，第一句", TS))
+    append(data, utterance("u-b", "达达，第二句", "2026-11-15T12:00:01+00:00"))
     deadline = time.time() + 3
-    while time.time() < deadline and [ev["ref"] for ev in replay(data, types="cue_played")] != ["turn-a", "turn-b"]:
+    while time.time() < deadline and [ev["ref"] for ev in replay(data, types="cue_played")] != ["u-a", "u-b"]:
         time.sleep(0.05)
     stop.set()
     thread.join(2)
     rows = list(replay(data, types="cue_played"))
-    assert [ev["ref"] for ev in rows] == ["turn-a", "turn-b"]
+    assert [ev["ref"] for ev in rows] == ["u-a", "u-b"]
     assert rows[0]["data"]["ok"] is False and rows[0]["data"]["backend"] == "log"
     assert rows[1]["data"]["ok"] is True
     assert "no device" in caplog.text
     assert not thread.is_alive()
 
 
-def test_cue_test_prints_a_result_and_writes_no_event(capsys):
+def test_a_failed_cue_write_does_not_play_again(tmp_path, monkeypatch):
+    import audi27.cue as cue_mod
+
+    data = tmp_path / "data"
+    calls = []
+
+    def player(sound):
+        calls.append(sound)
+        return {"ok": True, "backend": "mock", "sound": sound}
+
+    real = cue_mod.append
+    hits = {"n": 0}
+
+    def flaky(data_dir, event, if_absent=False):
+        if event.get("type") == "cue_played":
+            hits["n"] += 1
+            if hits["n"] == 1:
+                raise OSError("no space")
+        return real(data_dir, event, if_absent=if_absent)
+
+    monkeypatch.setattr(cue_mod, "append", flaky)
+    thread, stop = _serve(data, C.Config(), player)
+    append(data, utterance("u1", "达达，记一下", TS))
+    deadline = time.time() + 3
+    while time.time() < deadline and not list(replay(data, types="cue_played")):
+        time.sleep(0.05)
+    time.sleep(0.25)
+    stop.set()
+    thread.join(2)
+    assert calls == [SOUND]
+    rows = list(replay(data, types="cue_played"))
+    assert [ev["id"] for ev in rows] == ["cue-u1"]
+    assert hits["n"] >= 2
+
+
+def test_cue_test_prints_a_result_and_writes_no_event(capsys, monkeypatch):
+    def player(sound):
+        return {"ok": True, "backend": "mock", "sound": sound}
+
+    def boom(**_kwargs):
+        raise AssertionError("afplay should not be built")
+
+    monkeypatch.setattr("audi27.cue.build_player", lambda: player)
+    monkeypatch.setattr("audi27.cue.afplay_player", boom)
     assert main(["cue", "test"]) == 0
     out = capsys.readouterr().out.strip()
-    assert out.startswith(("log:", "afplay:")) and "Tink.aiff" in out
+    assert out == f"mock: {SOUND}"
     assert list(replay("data", types="cue_played")) == []
 
 

@@ -48,7 +48,7 @@ uv run pytest                        # 不需要麦克风和模型
 | `audi27 speak run` | 按顺序念 `brief`，写出 `spoken` |
 | `audi27 speak test "文字"` | 念一句，用来试声音；没有 `say` 就打印 |
 | `audi27 cue test` | 响一声唤醒提示音，不写事件；没有 `afplay` 就打印 |
-| `audi27 cue run` | 跟着 turn，一检测到唤醒词就播放一声短提示 |
+| `audi27 cue run` | 一听到唤醒词就播放一声短提示，不等这一轮收口 |
 | `audi27 screen run` | 记录最前面的应用和窗口标题（默认关，仅 macOS 真正采样） |
 | `audi27 grokbot test "文本"` | 向 Grok Bot webhook 发一条测试 POST，打印 HTTP 状态码 |
 | `audi27 grokbot inbox` | 只盯 `inbox/grokbot` 的回复文件（`dispatch run` 也会盯） |
@@ -91,7 +91,7 @@ uv run audi27 turns run                           # 常驻写 turn
 
 ## 唤醒提示音
 
-检测到一轮唤醒词（`turn` 刚写出来、路由和分派还没动手）时，`cue` 在本机响一声短提示。默认关，和其它常驻开关一样。要听到，在自己的 `config.toml` 里加上（从旧的 `config.example.toml` 抄来的文件没有这一节，缺了就保持安静）：
+一听到唤醒词就在本机响一声，不用等这一轮收口（`wall_close_s`，默认 8 秒），路由和分派也都还没动手。`cue` 直接看 `utterance`：状态是 `ok` 或 `suspect`，并且句首对上 `[turns] triggers`（用你配置的那份，所以「答答」「搭搭」这种自己加的同音词也算）。后面接着说的话、被丢掉的 `rejected`、空文本，都不响。默认关，和其它常驻开关一样。要听到，在自己的 `config.toml` 里加上（从旧的 `config.example.toml` 抄来的文件没有这一节，缺了就保持安静）：
 
 ```toml
 [cue]
@@ -99,7 +99,7 @@ enabled = true
 sound = "/System/Library/Sounds/Tink.aiff"   # 可省略，这是默认值
 ```
 
-同时把 `[turns] enabled` 打开，否则没有 turn 可应答。`./start.sh` 会拉起 `audi27 cue run`。macOS 用 `afplay` 播放，最长 1 秒，不等它播完，所以不会拖住转写。文件不存在、没有 `afplay`、或者不是 macOS，只记一条日志，进程不退出。每条新 turn 追加一条 `cue_played`（`ref` 指向那条 turn）。第一次启动不补历史。`audi27 cue test` 只响一声，不写事件。
+`./start.sh` 会拉起 `audi27 cue run`。macOS 用 `afplay` 播放，最长 1 秒，不等它播完，所以不会拖住转写。文件不存在、没有 `afplay`、或者不是 macOS，只记一条日志，进程不退出。每条命中的 utterance 追加一条 `cue_played`（`id` 是 `cue-<utterance id>`，`ref` 指向那条 utterance）。同一条不会响第二次；事件没写上也会先记住，下一轮只补写、不再响。第一次启动不补历史。`audi27 cue test` 只响一声，不写事件。
 
 提示音很短。麦克风如果把这一声听成没有触发词的「确认 / 好的 / ok」，确认门会把它当成自己的回声丢掉，和念读回时的处理一样。带「达达」的一轮仍然算数。`ok` 为 false 的记录表示没响成，不会吞掉后面的回答。
 
