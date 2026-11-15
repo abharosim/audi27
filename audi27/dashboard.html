@@ -609,6 +609,11 @@ async function loadRoutes(force) {
   }
   list.append(table);
 }
+async function confirmTask(taskId, decision) {
+  const res = await postJSON('/api/confirm', {task_id: taskId, decision});
+  if (res.error) { $('loopList').prepend(el('div', 'empty', '没有记下：' + res.error)); return; }
+  await loadLoop();
+}
 async function loadLoop() {
   const box = $('loopList');
   if (!box) return;
@@ -626,7 +631,19 @@ async function loadLoop() {
   table.append(head);
   for (const r of rows) {
     const tr = el('tr');
-    tr.append(el('td', 'when', routeWhen(r.ts)), el('td', '', r.type || ''), el('td', 'turn', r.summary || ''));
+    const said = el('td', 'turn', r.summary || '');
+    if (r.status === 'awaiting_confirmation' && r.task_id) {
+      const yes = el('button', 'btn small', '确认');
+      yes.title = '批准这件事'; yes.setAttribute('aria-label', '确认');
+      yes.onclick = () => confirmTask(r.task_id, 'approve');
+      const no = el('button', 'btn small', '取消');
+      no.title = '取消这件事'; no.setAttribute('aria-label', '取消');
+      no.onclick = () => confirmTask(r.task_id, 'reject');
+      const tools = el('div', 'tools');
+      tools.append(yes, no);
+      said.append(tools);
+    }
+    tr.append(el('td', 'when', routeWhen(r.ts)), el('td', '', r.type || ''), said);
     table.append(tr);
   }
   box.append(table);

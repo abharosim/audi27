@@ -216,6 +216,10 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                         raise ValueError("correct must be true or false")
                     else:
                         self._json(save_route_verdict(root, route_id, correct=body["correct"]))
+                elif path == "/api/confirm":
+                    from .confirm import record_decision
+                    self._json(record_decision(root, str(body.get("task_id") or ""),
+                                               str(body.get("decision") or "")))
                 else:
                     self._json({"error": "not found"}, 404)
             except (ValueError, C.ConfigError) as e:
@@ -246,10 +250,10 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
 
 
 def list_loop(root, *, limit: int = 200) -> dict:
-    """Recent task / reply / brief / spoken events, newest first. Read-only."""
+    """Recent task / reply / brief / spoken / confirm events, newest first. Read-only."""
     rows = []
     for ev in replay(root):
-        if ev.get("type") not in ("task", "reply", "brief", "spoken"):
+        if ev.get("type") not in ("task", "reply", "brief", "spoken", "confirm"):
             continue
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         if ev["type"] == "task":
@@ -259,15 +263,20 @@ def list_loop(root, *, limit: int = 200) -> dict:
             summary = data.get("text") or ""
         elif ev["type"] == "brief":
             summary = f"[{data.get('priority') or ''}] {data.get('summary') or ''}"
+        elif ev["type"] == "confirm":
+            summary = " ".join(str(x) for x in (data.get("decision"), data.get("task_id")) if x)
         else:
             flag = "interrupted" if data.get("interrupted") else "completed" if data.get("completed") else ""
             summary = " ".join(x for x in (flag, data.get("text") or "") if x)
         text = " ".join(str(summary).split())
         if len(text) > 240:
             text = text[:239] + "…"
+        task_id = ev["id"] if ev["type"] == "task" else data.get("task_id")
         rows.append({
             "id": ev["id"], "ts": ev.get("ts"), "type": ev["type"],
             "ref": ev.get("ref"), "summary": text,
+            "status": data.get("status") if ev["type"] == "task" else None,
+            "task_id": task_id if isinstance(task_id, str) else None,
         })
     if limit > 0:
         rows = rows[-limit:]

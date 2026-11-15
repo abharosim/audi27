@@ -1,7 +1,8 @@
 """`audi27 supervise`: keep the recorder and the dashboard running.
 
 `[turns] enabled`, `[route] enabled`, `[dispatch] enabled`, `[queue] enabled`,
-and `[speak] enabled` add those processes. All default off. `[presence] enabled`
+`[speak] enabled`, and `[confirm] enabled` add those processes. All default off.
+`[presence] enabled`
 does not add one: the recorder publishes `data/presence.json` itself, and only
 when that flag is on. A child that exits is
 started again on its own (1 s -> 30 s backoff). When data/restart.request appears,
@@ -110,7 +111,7 @@ def supervise(data_dir: str | Path, specs: dict[str, list[str]], reexec, poll_s:
 
 def child_specs(config_path: str | None, host: str, port: int, *, turns: bool = False,
                  route: bool = False, dispatch: bool = False, queue: bool = False,
-                 speak: bool = False) -> dict[str, list[str]]:
+                 speak: bool = False, confirm: bool = False) -> dict[str, list[str]]:
     """Recorder and dashboard, plus whichever live loops have `[enabled] = true`."""
     base = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     specs = {"run": base + ["run"], "web": base + ["web", "--host", host, "--port", str(port)]}
@@ -124,14 +125,16 @@ def child_specs(config_path: str | None, host: str, port: int, *, turns: bool = 
         specs["queue"] = base + ["queue", "run"]
     if speak:
         specs["speak"] = base + ["speak", "run"]
+    if confirm:
+        specs["confirm"] = base + ["confirm", "run"]
     return specs
 
 
 def main(config_path: str | None, data_dir: str, host: str, port: int, *, turns: bool = False,
          route: bool = False, dispatch: bool = False, queue: bool = False,
-         speak: bool = False) -> None:
+         speak: bool = False, confirm: bool = False) -> None:
     specs = child_specs(config_path, host, port, turns=turns, route=route,
-                        dispatch=dispatch, queue=queue, speak=speak)
+                        dispatch=dispatch, queue=queue, speak=speak, confirm=confirm)
     argv = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     argv += ["supervise", "--host", host, "--port", str(port)]
     supervise(data_dir, specs, lambda: os.execv(sys.executable, argv))

@@ -29,7 +29,8 @@ class Agent:
         On success the statuses are `sent`, `running`, `done`, then a `reply`
         whose `ref` is the done task. On failure the last task is `failed` and
         there is no reply. `awaiting_confirmation` is emitted by the dispatcher,
-        not by an adapter: a route that needs confirmation is never handed here.
+        not by an adapter. The dispatcher calls `handle` for that route only
+        after an explicit approve, and still at most once.
 
         The dispatcher calls this at most once per route. Emit `sent` before
         any side effect. A slow agent may call `emit` again after this method

@@ -103,6 +103,8 @@ timeout_s = 8.0
 # fake adapter until a real one is configured. Set grok = "grokbot" to POST
 # that target to Grok Bot (see [grokbot]). none/queue are never dispatched.
 # needs_confirmation writes a task (awaiting_confirmation) and does not call the adapter.
+# With [confirm] off that task stays there. With it on, an approve confirm event
+# sends it once, reject cancels it, and ttl_s expires it.
 [dispatch]
 enabled = false
 
@@ -133,6 +135,17 @@ timeout_s = 10            # seconds for the POST; one retry, and only on a netwo
 context_utterances = 0    # last N utterances included in the POST; 0 sends none. Max 20.
 reply_timeout_s = 1800    # no reply file in this many seconds -> task failed
 parse_retries = 3         # JSON parse errors before a reply file is quarantined
+
+# Confirmation gate. Off (the default) leaves awaiting_confirmation forever.
+# On: the queue reads the action back and asks 确认还是取消？ A following 达达
+# turn, a bare answer within window_s of that read-back, or a dashboard button
+# writes a confirm event. The dispatcher sends the original route only after
+# approve. ttl_s later the task is expired and is never sent.
+# `enabled` starts `audi27 confirm run` from start.sh.
+[confirm]
+enabled = false
+ttl_s = 600
+window_s = 20
 
 # Report queue. `enabled` starts `audi27 queue run` from start.sh.
 # The first start does not brief history; a restart replays from that point.

@@ -111,6 +111,16 @@ class GrokbotCfg:
 
 
 @dataclass
+class ConfirmCfg:
+    # Voice/dashboard confirmation of needs_confirmation tasks. Default off:
+    # a task stays awaiting_confirmation and the adapter is never called.
+    # `audi27 supervise` starts `confirm run` only when this is true.
+    enabled: bool = False
+    ttl_s: float = 600.0       # pending confirmation older than this becomes expired
+    window_s: float = 20.0     # bare (no wake word) answers are accepted this long after the read-back
+
+
+@dataclass
 class QueueCfg:
     # `audi27 supervise` starts `queue run` only when this is true. `queue run` ignores it.
     enabled: bool = False
@@ -160,6 +170,7 @@ class Config:
     dispatch: DispatchCfg = field(default_factory=DispatchCfg)
     fake: FakeCfg = field(default_factory=FakeCfg)
     grokbot: GrokbotCfg = field(default_factory=GrokbotCfg)
+    confirm: ConfirmCfg = field(default_factory=ConfirmCfg)
     queue: QueueCfg = field(default_factory=QueueCfg)
     speak: SpeakCfg = field(default_factory=SpeakCfg)
     presence: PresenceCfg = field(default_factory=PresenceCfg)
@@ -233,6 +244,7 @@ def _check_all(cfg: Config) -> None:
     _check_dispatch(cfg)
     _check_fake(cfg)
     _check_grokbot(cfg)
+    _check_confirm(cfg)
     _check_queue(cfg)
     _check_speak(cfg)
     _check_presence(cfg)
@@ -316,6 +328,18 @@ def _check_grokbot(cfg: Config) -> None:
         raise ConfigError("grokbot.parse_retries must be an integer")
     if g.parse_retries < 1:
         raise ConfigError("grokbot.parse_retries must be >= 1")
+
+
+def _check_confirm(cfg: Config) -> None:
+    c = cfg.confirm
+    if not isinstance(c.enabled, bool):
+        raise ConfigError("confirm.enabled must be true or false")
+    c.ttl_s = _as_float(c.ttl_s, "confirm.ttl_s")
+    c.window_s = _as_float(c.window_s, "confirm.window_s")
+    if c.ttl_s <= 0:
+        raise ConfigError("confirm.ttl_s must be > 0")
+    if c.window_s < 0:
+        raise ConfigError("confirm.window_s must be >= 0")
 
 
 def _check_queue(cfg: Config) -> None:
