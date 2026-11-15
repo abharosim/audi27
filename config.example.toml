@@ -1,0 +1,84 @@
+# Copy to config.toml and edit. Every key is optional; unknown keys are an error.
+
+[audio]
+device = ""            # "" = system default input; or a name substring / index from `audi27 devices`
+sample_rate = 16000
+frame_ms = 30
+
+[segment]
+start_margin_db = 10.0   # speech must be this many dB above the tracked noise floor
+min_db = -50.0           # absolute floor (dBFS); quieter frames are never speech
+start_ms = 150           # consecutive speech needed to open a segment
+end_silence_ms = 800     # silence that closes a segment
+pre_roll_ms = 300        # audio kept from before the trigger
+min_speech_ms = 400      # segments with less voiced audio are dropped before transcription
+max_segment_s = 30.0     # hard cut
+
+[transcribe]
+backends = ["mlx_whisper"]      # tried in order; later ones are fallbacks, e.g. ["mlx_whisper", "openai"]
+languages = ["zh", "en"]        # [] = any language; one = forced; several = auto-detect limited to these
+# Style/vocabulary hint (add names, repos). Echoes of it are rejected by validation. "" disables it.
+initial_prompt = "以下是普通话和 English 混合的对话。"
+max_attempts = 5                # per segment, with backoff; then it moves to data/failed/
+
+[backend.mlx_whisper]           # Apple Silicon GPU; reuses the model already in ~/.cache/huggingface
+model = "mlx-community/whisper-turbo"
+
+[backend.faster_whisper]        # CPU; downloads its own ~1.6 GB model on first use
+model = "large-v3-turbo"
+device = "auto"
+compute_type = "int8"
+beam_size = 5
+vad_filter = true
+
+[backend.openai]                # any OpenAI-compatible /audio/transcriptions endpoint
+base_url = "https://api.openai.com/v1"
+model = "whisper-1"
+api_key_env = "OPENAI_API_KEY"
+response_format = "verbose_json"   # verbose_json returns per-segment confidence; "json" does not
+timeout_s = 60.0
+
+# A second configuration of the same implementation, under its own name. Used as the reference
+# for `audi27 eval`: uv run audi27 eval run gold && uv run audi27 eval compare --ref gold
+[backend.gold]                  # xAI Grok Speech to Text; needs XAI_API_KEY in .env
+type = "xai"
+model = "grok-voice-transcribe-2.0"
+
+# [backend.gpt]                 # OpenAI alternative; needs OPENAI_API_KEY in .env
+# type = "openai"
+# model = "gpt-transcribe"
+# response_format = "json"
+
+[validate]
+max_no_speech_prob = 0.6
+min_avg_logprob = -1.0
+max_compression_ratio = 2.4
+min_language_prob = 0.5
+max_chars_per_sec = 25.0
+extra_hallucination_phrases = []
+
+# Context-aware correction after recognition. See context.md for the context/glossary format.
+[correct]
+enabled = true
+context_file = "context.md"   # plain text, re-read whenever it changes
+llm = true                    # false = only the deterministic glossary replacements
+backend = "mlx_lm"            # a [corrector.<name>] entry
+min_tokens = 4                # shorter texts skip the LLM
+recent_lines = 5              # previous lines shown to the LLM
+max_change = 0.3              # refuse proposals that change more than this share of the tokens
+max_context_chars = 1500
+
+[corrector.mlx_lm]            # in-process, Apple Silicon; uses only models already in ~/.cache/huggingface
+model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+
+# [corrector.server]          # any OpenAI-compatible chat endpoint: LM Studio, Ollama, oMLX, or a cloud API
+# type = "openai_chat"
+# base_url = "http://127.0.0.1:1234/v1"
+# model = "qwen2.5-7b-instruct"
+# api_key_env = ""            # e.g. "XAI_API_KEY" with base_url = "https://api.x.ai/v1"
+
+[store]
+data_dir = "data"
+# "all" | "suspect" (only suspect+rejected) | "none". Replay/eval and playback need the audio:
+# "all" costs ~115 MB per hour of actual speech (16 kHz mono WAV).
+keep_audio = "all"
