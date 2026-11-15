@@ -23,6 +23,7 @@ from .events import replay
 from .route import list_routes, save_route_verdict
 from .status import read_status
 from .store import clean_json, parse_when, search
+from .taskboard import snapshot as task_snapshot
 from .transcribers import TranscribeError
 
 log = logging.getLogger("audi27.web")
@@ -192,6 +193,8 @@ def make_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8727,
                     if limit < 1 or limit > 1000:
                         raise ValueError("limit must be 1..1000")
                     self._json(list_routes(root, limit=limit))
+                elif url.path == "/api/tasks":
+                    self._json(task_snapshot(root))
                 elif url.path == "/api/loop":
                     limit = int(q.get("limit", 200))
                     if limit < 1 or limit > 1000:

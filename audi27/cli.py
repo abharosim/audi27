@@ -597,7 +597,7 @@ def main(argv=None) -> int:
     ec.add_argument("--worst", type=int, default=10, help="show the N segments with the largest disagreement")
     ec.add_argument("--json", action="store_true")
     e.set_defaults(fn=cmd_eval)
-    w = sub.add_parser("web", help="local dashboard: live status, waveform, transcripts")
+    w = sub.add_parser("web", help="local dashboard: live status, waveform, transcripts, task status")
     w.add_argument("--host", default="127.0.0.1")
     w.add_argument("--port", type=int, default=8727)
     w.add_argument("--data-dir")
