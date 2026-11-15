@@ -112,6 +112,18 @@ class SpeakCfg:
 
 
 @dataclass
+class PresenceCfg:
+    # The recorder publishes data/presence.json only when this is true. Default off:
+    # the speaker keeps using the status.json heartbeat. Not a separate process.
+    enabled: bool = False
+    publish_s: float = 0.1     # refresh the file at least this often; also on every change
+    stale_s: float = 1.0       # older than this, or timestamped in the future, is unknown
+    onset_ms: int = 60         # continuous speech before "speaking"; capped at 200
+    hangover_ms: int = 400     # continuous silence before "quiet"
+    grace_s: float = 0.3       # after quiet, the speaker waits this long before starting
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -136,6 +148,7 @@ class Config:
     fake: FakeCfg = field(default_factory=FakeCfg)
     queue: QueueCfg = field(default_factory=QueueCfg)
     speak: SpeakCfg = field(default_factory=SpeakCfg)
+    presence: PresenceCfg = field(default_factory=PresenceCfg)
     backend: dict = field(default_factory=dict)  # name -> constructor kwargs
     corrector: dict = field(default_factory=dict)  # name -> constructor kwargs
 
@@ -207,6 +220,7 @@ def _check_all(cfg: Config) -> None:
     _check_fake(cfg)
     _check_queue(cfg)
     _check_speak(cfg)
+    _check_presence(cfg)
 
 
 def _check_route(cfg: Config) -> None:
@@ -275,6 +289,33 @@ def _check_speak(cfg: Config) -> None:
     if not isinstance(s.voice, str) or not s.voice.strip():
         raise ConfigError("speak.voice must be a voice name, e.g. Tingting")
     s.voice = s.voice.strip()
+
+
+def _as_float(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{name} must be a number")
+    return float(value)
+
+
+def _check_presence(cfg: Config) -> None:
+    p = cfg.presence
+    if not isinstance(p.enabled, bool):
+        raise ConfigError("presence.enabled must be true or false")
+    p.publish_s = _as_float(p.publish_s, "presence.publish_s")
+    p.stale_s = _as_float(p.stale_s, "presence.stale_s")
+    p.grace_s = _as_float(p.grace_s, "presence.grace_s")
+    if not 0 < p.publish_s <= 0.2:
+        raise ConfigError("presence.publish_s must be > 0 and <= 0.2")
+    if p.stale_s <= p.publish_s:
+        raise ConfigError("presence.stale_s must be greater than presence.publish_s")
+    if p.grace_s < 0 or p.grace_s > 5:
+        raise ConfigError("presence.grace_s must be between 0 and 5")
+    for name, limit in (("onset_ms", 200), ("hangover_ms", 5000)):
+        value = getattr(p, name)
+        number = _as_float(value, f"presence.{name}")
+        if number < 0 or number > limit:
+            raise ConfigError(f"presence.{name} must be between 0 and {limit}")
+        setattr(p, name, int(round(number)))
 
 
 _FROM_DOTENV: set = set()

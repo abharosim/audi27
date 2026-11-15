@@ -1,7 +1,9 @@
 """`audi27 supervise`: keep the recorder and the dashboard running.
 
 `[turns] enabled`, `[route] enabled`, `[dispatch] enabled`, `[queue] enabled`,
-and `[speak] enabled` add those processes. All default off. A child that exits is
+and `[speak] enabled` add those processes. All default off. `[presence] enabled`
+does not add one: the recorder publishes `data/presence.json` itself, and only
+when that flag is on. A child that exits is
 started again on its own (1 s -> 30 s backoff). When data/restart.request appears,
 every child is stopped cleanly and the supervisor re-executes itself, so a code
 change (including to this file) is picked up. data/supervisor.json records pid,

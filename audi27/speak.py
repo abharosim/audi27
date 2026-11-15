@@ -5,16 +5,19 @@ On any other OS, or when `say` is not on PATH, the line is logged and the
 spoken event still says it completed, with `backend` `log`. Tests pass a
 `backend(text, voice, stop_check)`.
 
-Interruption uses the recorder heartbeat (`data/status.json`, field
-`speaking`), which the capture loop already writes. Nothing is started while
-that flag is true. `say` is killed if the flag turns true mid-sentence.
-`say` cannot report how many words were spoken; `text` is the whole line that
-was handed to it.
+With `[presence] enabled` off (the default), interruption uses the recorder
+heartbeat (`data/status.json`, field `speaking`), written about every 0.4 s.
+Nothing is started while that flag is true. `say` is killed if the flag turns
+true mid-sentence. `say` cannot report how many words were spoken; `text` is
+the whole line that was handed to it.
 
-TODO: the heartbeat is written about every 0.4 s, so a mid-sentence stop is
-slower than the 0.2 s the design asks for. A faster heartbeat or a local
-socket from the recorder would close that gap. This module only reads the
-file that already exists.
+With presence on, the speaker reads `data/presence.json` instead. It does not
+start while that state is `speaking` or for `grace_s` after speech ends. The
+file is updated on the transition and at least every `publish_s`, and this
+loop polls quickly enough that `say` is killed within about 0.3 s of the file
+saying `speaking`. The spoken event then has `interrupted` true. The queue
+releases a new brief id for that item; this module does not speak a brief that
+already has a spoken event. A missing or stale presence file does not block.
 """
 from __future__ import annotations
 
@@ -22,12 +25,14 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+from . import presence as presence_mod
 from .events import append, make_event, read_new, replay, snapshot_offsets
 from .status import read_status
 
@@ -50,6 +55,17 @@ def user_speaking(data_dir) -> bool:
     return bool(status.get("speaking"))
 
 
+def user_busy(data_dir, cfg, now: float | None = None) -> bool:
+    """True when the speaker should stay quiet.
+
+    Presence off: the heartbeat above, unchanged. Presence on: the fast file.
+    """
+    presence = getattr(cfg, "presence", None)
+    if presence is None or not presence.enabled:
+        return user_speaking(data_dir)
+    return presence_mod.busy(data_dir, presence, now=now)
+
+
 def _wait_quiet(speaking, stop: threading.Event | None, poll_s: float) -> bool:
     """Block until `speaking()` is false. False when `stop` is set first."""
     while True:
@@ -69,12 +85,19 @@ def _wait_quiet(speaking, stop: threading.Event | None, poll_s: float) -> bool:
             time.sleep(poll_s)
 
 
-def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, platform: str | None = None):
+def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, platform: str | None = None,
+                group: bool = False, term_timeout: float = 1.0):
     """`backend(text, voice, stop_check) -> {text, completed, interrupted, backend}`.
 
     `stop_check()` is polled while `say` runs. True kills the process and the
     result is interrupted. A non-zero exit (unknown voice, say missing at
     runtime) is logged instead of retried, so a bad voice cannot spin the queue.
+
+    `group` is off unless presence is on, so the flag-off path still starts
+    `say` in this process's group and waits a second before SIGKILL. With
+    presence on, `say` is its own session: SIGTERM goes to the group immediately
+    and SIGKILL follows after `term_timeout` (0.2 s), including a child that
+    ignored SIGTERM after the leader exited.
     """
     host = sys.platform if platform is None else platform
 
@@ -91,16 +114,18 @@ def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep,
                 return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
         except Exception:
             log.exception("could not read whether the user is speaking")
-        proc = popen(["say", "-v", voice, "--", text])
+        proc = _spawn(popen, ["say", "-v", voice, "--", text], group=group)
         try:
             while True:
+                # Checked again immediately after spawn, before the first sleep,
+                # so speech that starts during process creation is not missed.
                 try:
                     talking = bool(stop_check())
                 except Exception:
                     log.exception("could not read whether the user is speaking")
                     talking = False
                 if talking:
-                    _stop_proc(proc)
+                    _stop_proc(proc, term_timeout)
                     return {"text": text, "completed": False, "interrupted": True, "backend": "say"}
                 if proc.poll() is not None:
                     break
@@ -113,24 +138,90 @@ def say_backend(*, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep,
         finally:
             # A signal, a timeout, or the caller giving up must not leave `say` running.
             if proc.poll() is None:
-                _stop_proc(proc)
+                _stop_proc(proc, term_timeout)
 
     return backend
 
 
-def _stop_proc(proc) -> None:
+def _spawn(popen, argv, *, group: bool):
+    """Start `say`. With `group`, it leads a new session so the group can be signalled."""
+    if not group:
+        return popen(argv)
     try:
-        proc.terminate()
-        proc.wait(timeout=1)
-    except Exception:
+        proc = popen(argv, start_new_session=True)
+    except TypeError:
+        return popen(argv)
+    if isinstance(getattr(proc, "pid", None), int) and proc.pid > 0:
+        proc._audi27_group = True  # noqa: SLF001
+        proc._audi27_pgid = proc.pid  # noqa: SLF001  setsid: pid is the process group id
+    return proc
+
+
+def _signal_proc(proc, sig: int, *, kill: bool) -> None:
+    pgid = getattr(proc, "_audi27_pgid", None)
+    if getattr(proc, "_audi27_group", False) and isinstance(pgid, int) and pgid > 0:
         try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+    try:
+        if kill:
             proc.kill()
-            proc.wait(timeout=1)
+        else:
+            proc.terminate()
+    except Exception:
+        log.exception("could not stop say")
+
+
+def _stop_proc(proc, term_timeout: float = 1.0) -> None:
+    """Stop `say`. Terminate, then kill if it is still there.
+
+    Without a process group this is the flag-off path: SIGTERM, wait
+    `term_timeout` (1 s), then SIGKILL. With a group (presence on), the signal
+    goes to the whole group, and the group is SIGKILLed even when the leader
+    has already exited so a child that ignored SIGTERM is not left running.
+    """
+    if not getattr(proc, "_audi27_group", False):
+        try:
+            proc.terminate()
+            proc.wait(timeout=term_timeout)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=term_timeout)
+            except Exception:
+                log.exception("could not stop say")
+        return
+    pgid = getattr(proc, "_audi27_pgid", None)
+    _signal_proc(proc, signal.SIGTERM, kill=False)
+    try:
+        proc.wait(timeout=term_timeout)
+    except Exception:
+        _signal_proc(proc, signal.SIGKILL, kill=True)
+        try:
+            proc.wait(timeout=term_timeout)
         except Exception:
             log.exception("could not stop say")
+    if isinstance(pgid, int) and pgid > 0:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
-def build_backend():
+def build_backend(cfg=None):
+    """Real `say`. With presence on, poll a little faster than the default 0.1 s.
+
+    The file is written on the transition, so a 0.05 s poll keeps the kill
+    inside about 0.3 s. The flag-off path keeps the 0.1 s poll and the 1 s
+    SIGKILL grace; it does not put `say` in its own session.
+    """
+    if cfg is not None and cfg.presence.enabled:
+        return say_backend(
+            sleep=lambda seconds: time.sleep(0.05 if seconds > 0.05 else seconds),
+            group=True, term_timeout=0.2,
+        )
     return say_backend()
 
 
@@ -178,9 +269,9 @@ def speak_pending(data_dir, cfg, *, backend=None, speaking=None, stop: threading
     Used by the end-to-end test. Live `serve` does not catch up: the first
     start snapshots the end so enabling the speaker does not read the backlog.
     """
-    backend = build_backend() if backend is None else backend
+    backend = build_backend(cfg) if backend is None else backend
     if speaking is None:
-        speaking = lambda: user_speaking(data_dir)  # noqa: E731
+        speaking = lambda: user_busy(data_dir, cfg)  # noqa: E731
     n = 0
     for brief in unspoken(data_dir):
         if not _wait_quiet(speaking, stop, poll_s):
@@ -203,7 +294,7 @@ def speak_pending(data_dir, cfg, *, backend=None, speaking=None, stop: threading
 
 def speak_text(text: str, cfg, *, backend=None, speaking=None, poll_s: float = 0.1) -> dict:
     """Speak one line and return the result. Does not write an event (`speak test`)."""
-    backend = build_backend() if backend is None else backend
+    backend = build_backend(cfg) if backend is None else backend
     if speaking is None:
         speaking = lambda: False  # noqa: E731
     if not _wait_quiet(speaking, None, poll_s):
@@ -262,10 +353,14 @@ def _already_spoken(data_dir, brief_id: str) -> bool:
 def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = None,
           ready: threading.Event | None = None, backend=None, speaking=None) -> None:
     """Speak new briefs. The first start does not read history. Blocks until `stop`."""
-    backend = build_backend() if backend is None else backend
+    backend = build_backend(cfg) if backend is None else backend
     if speaking is None:
-        speaking = lambda: user_speaking(data_dir)  # noqa: E731
+        speaking = lambda: user_busy(data_dir, cfg)  # noqa: E731
     stop = stop or threading.Event()
+    # While waiting out speech or the grace period, recheck about as often as
+    # the file is published. The idle poll between briefs stays `poll_s`.
+    # Flag off keeps a single interval, the one the caller passed.
+    wait_s = min(poll_s, cfg.presence.publish_s) if cfg.presence.enabled else poll_s
     offsets = _load_cursor(data_dir)
     durable = dict(offsets)
 
@@ -291,7 +386,7 @@ def serve(data_dir, cfg, *, poll_s: float = 0.2, stop: threading.Event | None = 
                 return False
             if _already_spoken(data_dir, brief["id"]):
                 continue
-            if not _wait_quiet(speaking, stop, poll_s):
+            if not _wait_quiet(speaking, stop, wait_s):
                 return False
 
             def stop_check():

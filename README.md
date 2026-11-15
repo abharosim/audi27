@@ -104,7 +104,8 @@ uv run audi27 route run                           # 常驻写 route
 
 - **分派** `audi27 dispatch run` 读 `route`，按 `[dispatch.adapters]` 找适配器（没写就是 `fake`）。`none` / `queue` 不发。`needs_confirmation` 只写一条 `task`（`awaiting_confirmation`），不调用适配器；口头确认留到后面。`fake` 把原文用「收到：…」回显，`delay_s` 是秒；正文里有 `fail_marker`（默认「模拟失败」）就失败且没有 `reply`，有 `decision_marker`（默认「需要你决定」）则回复里 `needs_decision` 为真。真实适配器（Claude Code、Grok、Muse、本地模型）以后按同一个 `handle(route, emit)` 加。第一次启动从事件流末尾开始，不补历史。
 - **队列** `audi27 queue run` 把 `reply` 和失败的 `task` 收成 `brief`。优先级是 decision > error > done > info。一次只放出一条，等 `spoken` 之后才放下一条；已经在念的不会被后来的更高优先级打断。摘要是第一句，超长截断；`summarize_fn` 是以后接模型的钩子，现在不调用。队列指令（target `queue`）：详细说说念全文，跳过丢掉当前条，稍后放到队尾，还有什么列剩下的，关掉清空。状态靠重放事件恢复，不另存一份。`audi27 queue show` 重放整段日志并打印，不写 brief。`queue run` 第一次启动不汇报历史，重启从那次的位置重放。
-- **播报** `audi27 speak run` 按 brief 的顺序调用 macOS `say`（`[speak] voice`，默认 `Tingting`）。写出 `spoken`：念了什么、是否念完、是否被打断。录音心跳 `data/status.json` 的 `speaking` 为真时不开始；念到一半变成真就停掉 `say`。心跳大约 0.4 秒写一次，所以停下来比设计里的 0.2 秒慢，要更快得改采集端。没有 `say`（比如 Linux 上的测试）就记一条日志，进程不退出。`say` 报不出念到第几个字，`text` 是交给它的整句。`audi27 speak test "文字"` 只试这一句，不写事件。第一次启动不补历史。
+- **播报** `audi27 speak run` 按 brief 的顺序调用 macOS `say`（`[speak] voice`，默认 `Tingting`）。写出 `spoken`：念了什么、是否念完、是否被打断。没有 `say`（比如 Linux 上的测试）就记一条日志，进程不退出。`say` 报不出念到第几个字，`text` 是交给它的整句。`audi27 speak test "文字"` 只试这一句，不写事件。第一次启动不补历史。
+- **在不在说话** `[presence] enabled` 默认关。关掉时，播报仍看录音心跳 `data/status.json` 的 `speaking`（大约 0.4 秒写一次），为真就不开始，念到一半变成真就停 `say`，也不写 presence 文件。打开后，录音进程用分段器已有的能量判断，把 `data/presence.json` 原子替换更新：状态一变就写，另外最快每 `publish_s`（默认 0.1 秒）刷新一次，所以信号在 0.2 秒内可读。说话要连续 `onset_ms`（默认 60 毫秒）才算开口，安静要连续 `hangover_ms`（默认 400 毫秒）才算停，中间换气不会来回翻转。只有翻转才追加一条 `presence` 事件（`data.state` 为 `speaking` 或 `quiet`）。播报在 `speaking` 期间，以及变回安静后的 `grace_s`（默认 0.3 秒）内，都不开口。念到一半文件变成 `speaking`，大约 0.3 秒内停掉 `say`，`spoken` 的 `interrupted` 为真；队列用新的 brief id 把同一条再放出一次，已经有 `spoken` 的那条不会再读。文件缺失、读不了、超过 `stale_s` 没更新、或时间戳在未来（时钟跳了），都当成不知道，不卡住。没有单独的 presence 进程，`start.sh` 不会因为这个开关多拉起一个进程。达达这一轮还开着时并不额外算忙：turn 事件是轮次结束才写的，流上看不到「还开着」。
 
 `spoken` 的 `ref` 指回 brief，再往前是 reply、task、route、turn、utterance。仪表盘「路由」页下面多一块「回路」，列出 task / reply / brief / spoken。
 
@@ -149,6 +150,7 @@ backends = ["mlx_whisper", "openai"]
 
 `audi27 web` 是只读的，只绑定 127.0.0.1。录音进程每 0.4 秒把心跳写到 `data/status.json`
 （音量、是否在说话、积压、丢帧），仪表盘据此判断是否在运行：心跳超过 3 秒没更新即显示"未运行"。
+`[presence]` 打开时另写的 `data/presence.json` 只给播报用，仪表盘仍看这份心跳。
 
 ## 回放与模型对比
 
@@ -172,7 +174,7 @@ uv run audi27 eval list
 
 ## 守护进程与重启
 
-`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。
+`./start.sh` 启动的是 `audi27 supervise`：它同时拉起录音和仪表盘，任一进程崩溃会自动重启（退避 1–30 秒）。`[turns]`、`[route]`、`[dispatch]`、`[queue]`、`[speak]` 的 `enabled` 为真时，对应的常驻进程也一起拉起，默认都是关的。`[presence] enabled` 也默认关，打开后不增加进程，只让录音进程写 `data/presence.json`。
 
 改完代码后重启，不需要碰那个终端：
 
