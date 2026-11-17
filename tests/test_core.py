@@ -578,6 +578,60 @@ def test_supervisor_restarts_crashed_child_and_reexecs_on_request(tmp_path):
     assert os.environ.pop("AUDI27_RESTARTS") == "1" and os.environ.pop("AUDI27_RESTART_REASON") == "code changed"
 
 
+def test_a_restart_sync_keeps_the_kws_extra_only_when_enabled(tmp_path, monkeypatch):
+    """A pyproject change must not `uv sync --extra dev` alone while the spotter is on."""
+    import os
+    import subprocess
+    import threading
+    import time
+
+    from audi27.supervisor import supervise
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    pyproject = proj / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    monkeypatch.setattr("audi27.supervisor.PROJECT", proj)
+    calls = []
+
+    def fake_run(argv, cwd=None, **_kwargs):
+        calls.append((list(argv), Path(cwd) if cwd is not None else None))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("audi27.supervisor.subprocess.run", fake_run)
+    monkeypatch.setattr("audi27.supervisor.shutil.which", lambda _name: "/usr/bin/uv")
+
+    class Reexec(Exception):
+        pass
+
+    def once(text: str):
+        calls.clear()
+        data = tmp_path / f"data-{abs(hash(text))}"
+        data.mkdir()
+        cfg = data / "config.toml"
+        cfg.write_text(text, encoding="utf-8")
+
+        def request():
+            time.sleep(0.15)
+            current = pyproject.stat().st_mtime
+            os.utime(pyproject, (current + 10, current + 10))
+            (data / "restart.request").write_text("deps")
+
+        threading.Thread(target=request, daemon=True).start()
+        with pytest.raises(Reexec):
+            supervise(
+                data, {}, lambda: (_ for _ in ()).throw(Reexec()),
+                poll_s=0.05, grace_s=1, config_path=str(cfg))
+        os.environ.pop("AUDI27_RESTARTS", None)
+        os.environ.pop("AUDI27_RESTART_REASON", None)
+        return list(calls)
+
+    assert once("[kws]\nenabled = true\n") == [
+        (["uv", "sync", "--extra", "dev", "--extra", "kws"], proj)]
+    assert once("[kws]\nenabled = false\n") == [
+        (["uv", "sync", "--extra", "dev"], proj)]
+
+
 def _post(port, path, body, headers=None):
     import urllib.error
     import urllib.request

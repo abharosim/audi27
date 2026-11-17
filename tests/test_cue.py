@@ -177,6 +177,130 @@ def _wait_cues(data, n, timeout=3):
     return found
 
 
+def _player(calls, *, ok=True):
+    def player(sound):
+        calls.append(sound)
+        return {"ok": ok, "backend": "mock" if ok else "log", "sound": sound}
+
+    return player
+
+
+def test_trigger_in_text_finds_a_wake_word_that_is_not_at_the_start():
+    from audi27.cue import trigger_in_text
+
+    assert trigger_in_text("今天达达，记一下", ["达达", "大大"]) == ("达达", False)
+    assert trigger_in_text("达达，记一下", ["达达"]) == ("达达", True)
+    assert trigger_in_text("  dada now", ["dada"]) == ("dada", True)
+    assert trigger_in_text("say dada now", ["dada"]) == ("dada", False)
+    assert trigger_in_text("大大小小", ["大大", "达达"]) == (None, False)
+    assert trigger_in_text("dadapple", ["dada"]) == (None, False)
+    assert trigger_in_text("明天下雨", ["达达"]) == (None, False)
+
+
+def test_a_trigger_that_is_not_at_the_start_is_a_skipped_decision(tmp_path, caplog):
+    from audi27.cue import ack
+
+    data = tmp_path / "data"
+    calls = []
+    caplog.set_level(logging.INFO)
+    assert ack(data, C.Config(), utterance("u-mid", "今天达达天气", TS), player=_player(calls), pending={}) is True
+    assert calls == []
+    assert list(replay(data, types="cue_played")) == []
+    rows = list(replay(data, types="cue_decision"))
+    assert len(rows) == 1
+    assert rows[0]["ref"] == "u-mid"
+    assert rows[0]["data"]["action"] == "skipped"
+    assert rows[0]["data"]["reason"] == "trigger not at start so no turn"
+    assert rows[0]["data"]["trigger"] == "达达"
+    assert "cue_decision" in KNOWN_TYPES
+    assert "u-mid" in caplog.text and "trigger not at start" in caplog.text
+
+
+def test_an_utterance_with_no_trigger_writes_no_decision(tmp_path, caplog):
+    from audi27.cue import ack
+
+    data = tmp_path / "data"
+    calls = []
+    caplog.set_level(logging.INFO)
+    said = utterance("u-ambient", "明天下雨", TS)
+    assert ack(data, C.Config(), said, player=_player(calls), pending={}) is True
+    assert calls == []
+    assert list(replay(data, types="cue_decision")) == []
+    assert list(replay(data, types="cue_played")) == []
+    assert "cue decision" not in caplog.text
+
+
+def test_a_rejected_trigger_is_skipped_for_status(tmp_path):
+    from audi27.cue import ack
+
+    data = tmp_path / "data"
+    calls = []
+    said = utterance("u-no", "达达，噪声", TS, status="rejected")
+    assert ack(data, C.Config(), said, player=_player(calls), pending={}) is True
+    assert calls == []
+    row = list(replay(data, types="cue_decision"))[0]["data"]
+    assert row["action"] == "skipped"
+    assert row["reason"] == "status not ok (rejected)"
+    assert row["trigger"] == "达达"
+
+
+def test_a_played_cue_and_a_player_error_are_decisions(tmp_path):
+    from audi27.cue import ack
+
+    data = tmp_path / "data"
+    calls = []
+    cfg = C.Config()
+    assert ack(data, cfg, utterance("u-ok", "达达，今天", TS), player=_player(calls), pending={}) is True
+    assert ack(data, cfg, utterance("u-bad", "哒哒，第二句", "2026-11-15T12:00:05+00:00"),
+               player=_player(calls, ok=False), pending={}) is True
+    rows = list(replay(data, types="cue_decision"))
+    assert [(row["ref"], row["data"]["action"], row["data"]["reason"]) for row in rows] == [
+        ("u-ok", "played", "played"),
+        ("u-bad", "skipped", "player error"),
+    ]
+    assert [ev["ref"] for ev in replay(data, types="cue_played")] == ["u-ok", "u-bad"]
+    assert calls == [cfg.cue.sound, cfg.cue.sound]
+
+
+def test_acking_the_same_utterance_again_is_dedup(tmp_path):
+    from audi27.cue import ack
+
+    data = tmp_path / "data"
+    calls = []
+    cfg = C.Config()
+    said = utterance("u1", "达达，记一下", TS)
+    assert ack(data, cfg, said, player=_player(calls), pending={}) is True
+    assert ack(data, cfg, said, player=_player(calls), pending={}) is True
+    assert calls == [cfg.cue.sound]
+    rows = list(replay(data, types="cue_decision"))
+    assert [row["data"]["reason"] for row in rows] == ["played", "dedup"]
+
+
+def test_a_failed_cue_write_does_not_emit_a_second_decision(tmp_path, monkeypatch):
+    import audi27.cue as cue_mod
+
+    data = tmp_path / "data"
+    calls = []
+    real = cue_mod.append
+    hits = {"n": 0}
+
+    def flaky(data_dir, event, if_absent=False):
+        if event.get("type") == "cue_played":
+            hits["n"] += 1
+            if hits["n"] == 1:
+                raise OSError("no space")
+        return real(data_dir, event, if_absent=if_absent)
+
+    monkeypatch.setattr(cue_mod, "append", flaky)
+    from audi27.cue import ack
+    said = utterance("u1", "达达，记一下", TS)
+    pending = {}
+    assert ack(data, C.Config(), said, player=_player(calls), pending=pending) is False
+    assert ack(data, C.Config(), said, player=_player(calls), pending=pending) is True
+    assert calls == [SOUND]
+    assert [row["data"]["reason"] for row in replay(data, types="cue_decision")] == ["played"]
+
+
 def test_a_wake_utterance_dings_and_a_continuation_does_not(tmp_path):
     from audi27.cue import SUPPRESS_S
 

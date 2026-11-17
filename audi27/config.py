@@ -217,6 +217,9 @@ class KwsCfg:
     tone_hz: float = 880.0
     tone_ms: int = 80
     debounce_ms: int = 1500
+    # While the spotter thread is alive, log counters and refresh kws.live stats
+    # this often. The capture callback does not log.
+    heartbeat_s: float = 60.0
 
 
 @dataclass
@@ -368,6 +371,9 @@ def _check_kws(cfg: Config) -> None:
     if not 0 <= debounce <= 10000:
         raise ConfigError("kws.debounce_ms must be between 0 and 10000")
     k.debounce_ms = int(round(debounce))
+    k.heartbeat_s = _as_float(k.heartbeat_s, "kws.heartbeat_s")
+    if not 1 <= k.heartbeat_s <= 3600:
+        raise ConfigError("kws.heartbeat_s must be between 1 and 3600")
 
 
 def _check_route(cfg: Config) -> None:
