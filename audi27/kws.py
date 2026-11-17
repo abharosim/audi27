@@ -10,7 +10,10 @@ same echo window confirm already reads). Hits closer than `debounce_ms` on
 the audio clock are ignored. Turns still come from Whisper text.
 
 The weights are not in the repo. `audi27 kws download` fetches them. A missing
-package or a missing model logs once and the spotter stays off.
+package or a missing model logs one ERROR (with the fix command) and one
+`kws_status` event, and the spotter stays off. Counters stay on this thread;
+the INFO heartbeat and the hit events are written by the event sink, not by
+the capture callback.
 
 Latency, after the last sample of the wake word is on the mic:
 the capture frame is `frame_ms` (default 30), the zipformer is chunk-16
@@ -77,18 +80,10 @@ _PHRASES = {
 }
 _CHAR_PINYIN = {"达": "dá", "哒": "dá", "大": "dà"}
 _VOWELS = set("aeiouüvāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ")
-_warned: set[str] = set()
 
 
 class KwsError(RuntimeError):
     pass
-
-
-def _warn_once(message: str) -> None:
-    if message in _warned:
-        return
-    _warned.add(message)
-    log.warning("%s", message)
 
 
 def split_syllable(syllable: str) -> list[str]:
@@ -323,9 +318,15 @@ class _LogPlayer:
     def __init__(self, label: str):
         self.label = label
 
+    def status(self) -> dict:
+        return {"backend": "log", "device": "", "stream": "closed"}
+
     def play(self) -> dict:
         log.info("kws: not playing %s", self.label)
-        return {"ok": False, "backend": "log", "sound": self.label}
+        return {
+            "ok": False, "backend": "log", "sound": self.label,
+            "device": "", "error": "no output device",
+        }
 
     def close(self) -> None:
         return None
@@ -376,7 +377,23 @@ class SoundDevicePlayer:
         self._device = None
         self._broken = False
         self._ok = False
-        self._reopen()
+        self._reopen("start")
+
+    def status(self) -> dict:
+        reason = self._unhealthy_reason()
+        if reason is None:
+            state = "open"
+        elif reason == "stream stopped":
+            state = "stopped"
+        elif reason == "closed":
+            state = "closed"
+        elif reason.startswith("device changed"):
+            state = "changed"
+        else:
+            state = "error"
+        backend = "sounddevice" if self._ok and self.stream is not None else "log"
+        device = "" if self._device is None else str(self._device)
+        return {"backend": backend, "device": device, "stream": state}
 
     def _close_stream(self) -> None:
         stream = self.stream
@@ -390,13 +407,13 @@ class SoundDevicePlayer:
         except Exception:
             log.exception("kws: output stream did not close")
 
-    def _reopen(self) -> bool:
+    def _reopen(self, reason: str) -> bool:
         self._close_stream()
         try:
             device = self.backend.output_device()
             self.stream = self.backend.open_stream(self._on_audio, self.sample_rate)
-        except Exception:
-            log.warning("kws: output stream did not start; the next hit will try again")
+        except Exception as e:
+            log.error("kws: output stream did not start (%s): %s", reason, e)
             self.stream = None
             self._device = None
             self._broken = False
@@ -405,19 +422,34 @@ class SoundDevicePlayer:
         self._device = device
         self._broken = False
         self._ok = True
+        if reason == "start":
+            log.info(
+                "kws: output stream open device=%s rate=%s backend=sounddevice",
+                device, self.sample_rate)
+        else:
+            log.info(
+                "kws: output stream reopen (%s) device=%s backend=sounddevice",
+                reason, device)
         return True
 
-    def _healthy(self) -> bool:
+    def _unhealthy_reason(self) -> str | None:
         stream = self.stream
-        if stream is None or self._broken or not self._ok:
-            return False
+        if stream is None or not self._ok:
+            return "closed"
+        if self._broken:
+            return "callback error"
         if getattr(stream, "active", True) is False:
-            return False
+            return "stream stopped"
         try:
             device = self.backend.output_device()
         except Exception:
-            return True
-        return device == self._device
+            return None
+        if device != self._device:
+            return f"device changed from {self._device} to {device}"
+        return None
+
+    def _healthy(self) -> bool:
+        return self._unhealthy_reason() is None
 
     def _on_audio(self, outdata, frames, _time_info, _status) -> None:
         # `_status` is an underflow/overflow flag. A stopped or unplugged device
@@ -437,11 +469,20 @@ class SoundDevicePlayer:
             self._broken = True
 
     def play(self) -> dict:
-        if not self._healthy() and not self._reopen():
-            return {"ok": False, "backend": "log", "sound": self.label}
+        reason = self._unhealthy_reason()
+        if reason is not None and not self._reopen(reason):
+            return {
+                "ok": False, "backend": "log", "sound": self.label,
+                "device": "" if self._device is None else str(self._device),
+                "error": "output stream did not start",
+            }
         with self._lock:
             self._pos = 0
-        return {"ok": True, "backend": "sounddevice", "sound": self.label}
+        device = "" if self._device is None else str(self._device)
+        return {
+            "ok": True, "backend": "sounddevice", "sound": self.label,
+            "device": device, "error": "",
+        }
 
     def close(self) -> None:
         self._close_stream()
@@ -592,8 +633,12 @@ def _put_drop_oldest(q: queue.Queue, item) -> int:
             dropped += 1
 
 
-def write_live(data_dir, started: float, *, updated: float | None = None) -> None:
-    """Atomically replace `kws.live`. Readers see the previous file or this one."""
+def write_live(data_dir, started: float, *, updated: float | None = None, stats=None) -> None:
+    """Atomically replace `kws.live`. Readers see the previous file or this one.
+
+    `stats` (frame counters, realtime factor, player) is merged in. `pid`,
+    `started`, and `updated` stay the liveness fields the text cue reads.
+    """
     root = Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -601,6 +646,13 @@ def write_live(data_dir, started: float, *, updated: float | None = None) -> Non
         "started": float(started),
         "updated": float(time.time() if updated is None else updated),
     }
+    if isinstance(stats, dict):
+        for key, value in stats.items():
+            if key in payload:
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                value = None
+            payload[key] = value
     tmp = root / (LIVE_NAME + ".tmp")
     try:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -611,6 +663,15 @@ def write_live(data_dir, started: float, *, updated: float | None = None) -> Non
         except OSError:
             pass
         raise
+
+
+def read_live(data_dir) -> dict | None:
+    path = Path(data_dir) / LIVE_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def clear_live(data_dir) -> None:
@@ -720,6 +781,15 @@ class _EventSink:
             self.thread = threading.Thread(target=self._loop, name="audi27-kws-events", daemon=True)
             self.thread.start()
 
+    def note(self, message: str) -> None:
+        """INFO line off the decode thread. `sync` logs in the caller (tests)."""
+        if not message:
+            return
+        if self.sync or self.thread is None:
+            log.info("%s", message)
+            return
+        _put_drop_oldest(self.q, ("log", message))
+
     def submit(self, events: list) -> None:
         rows = [event for event in events if event is not None]
         if not rows:
@@ -742,6 +812,9 @@ class _EventSink:
                 continue
             if item is None:
                 break
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "log":
+                log.info("%s", item[1])
+                continue
             for event in item:
                 _write_event(self.data_dir, event)
 
@@ -770,6 +843,12 @@ class Tap:
         self.debounce_s = float(cfg.kws.debounce_ms) / 1000.0
         self.q = queue.Queue(maxsize=max(1, int(queue_size)))
         self.dropped = 0
+        self.frames = 0
+        self.decode_s = 0.0
+        self.audio_s = 0.0
+        self.hits = 0
+        self.lag_s = 0.0
+        self._heartbeat_at = time.time()
         self.stop = threading.Event()
         self._closed = False
         self._started = False
@@ -813,14 +892,19 @@ class Tap:
             if 0 <= delta < self.debounce_s:
                 return False
         self._last_ts = float(audio_ts)
+        self.hits += 1
         started = datetime.now().astimezone()
+        latency_s = round(time.time() - float(audio_ts), 3)
         try:
             result = self._play()
         except Exception:
             log.exception("kws: cue failed")
             result = None
         if not isinstance(result, dict):
-            result = {"ok": False, "backend": "log", "sound": ""}
+            result = {
+                "ok": False, "backend": "log", "sound": "",
+                "device": "", "error": "player raised",
+            }
         ok = bool(result.get("ok"))
         backend = result.get("backend")
         if not isinstance(backend, str) or not backend.strip():
@@ -828,11 +912,26 @@ class Tap:
         sound = result.get("sound")
         if not isinstance(sound, str):
             sound = ""
+        device = result.get("device")
+        if not isinstance(device, str):
+            device = ""
+        error = result.get("error")
+        if not isinstance(error, str):
+            error = ""
+        device = device.strip()[:80]
+        error = error.strip()[:200]
+        if not ok and not error:
+            error = "cue was not played"
         ms = int(round(float(audio_ts) * 1000))
         wake_id = f"wake-{ms}"
         data = {
             "keyword": keyword,
             "audio_ts": round(float(audio_ts), 3),
+            "latency_s": latency_s,
+            "play_ok": ok,
+            "play_backend": backend.strip()[:40],
+            "play_device": device,
+            "play_error": "" if ok else error,
         }
         try:
             wake = make_event(
@@ -856,10 +955,43 @@ class Tap:
             cue = None
         self.events.submit([wake] if cue is None else [wake, cue])
         if ok:
-            log.info("kws hit %s", keyword)
+            self.events.note(
+                f"kws hit {keyword} latency_s={latency_s:.3f} play=ok device={device or '-'}")
         else:
-            log.info("kws hit %s; cue was not played", keyword)
+            self.events.note(
+                f"kws hit {keyword} latency_s={latency_s:.3f} play=error "
+                f"device={device or '-'} error={error or 'cue was not played'}")
         return True
+
+    def snapshot(self) -> dict:
+        """Cheap counters. No logging and no device I/O beyond `player.status`."""
+        audio = float(self.audio_s)
+        rtf = None if audio <= 0 else round(self.decode_s / audio, 3)
+        view = player_view(self.player)
+        return {
+            "frames": int(self.frames),
+            "dropped": int(self.dropped),
+            "decode_s": round(float(self.decode_s), 3),
+            "audio_s": round(audio, 3),
+            "rtf": rtf,
+            "lag_s": round(float(self.lag_s), 3),
+            "hits": int(self.hits),
+            "player": view["backend"],
+            "stream": view["stream"],
+            "output_device": view["device"],
+        }
+
+    def _maybe_heartbeat(self, now=None) -> None:
+        now = time.time() if now is None else float(now)
+        if now - self._heartbeat_at < float(self.cfg.kws.heartbeat_s):
+            return
+        self._heartbeat_at = now
+        stats = self.snapshot()
+        try:
+            write_live(self.data_dir, self._live_started, updated=now, stats=stats)
+        except OSError:
+            log.exception("kws live file was not written")
+        self.events.note(heartbeat_line(stats))
 
     def _touch_live(self, force: bool = False) -> None:
         if self._closed:
@@ -869,7 +1001,7 @@ class Tap:
             return
         self._live_touch = now
         try:
-            write_live(self.data_dir, self._live_started)
+            write_live(self.data_dir, self._live_started, stats=self.snapshot())
         except OSError:
             log.exception("kws live file was not written")
 
@@ -882,6 +1014,7 @@ class Tap:
             try:
                 frame, ts = self.q.get(timeout=0.2)
             except queue.Empty:
+                self._maybe_heartbeat()
                 if self.stop.is_set():
                     break
                 continue
@@ -889,6 +1022,8 @@ class Tap:
                 break
             if len(frame) == 0 or self.engine is None:
                 continue
+            t0 = time.perf_counter()
+            keyword = None
             try:
                 samples = _frames_to_model(frame, self.sample_rate)
                 keyword = self.engine.accept(samples, MODEL_RATE)
@@ -896,7 +1031,11 @@ class Tap:
                 if not self._failed:
                     log.exception("kws: spotter failed; this hit is skipped")
                     self._failed = True
-                continue
+            self.frames += 1
+            self.decode_s += time.perf_counter() - t0
+            self.audio_s += len(frame) / float(self.sample_rate)
+            self.lag_s = time.time() - (float(ts) + len(frame) / float(self.sample_rate))
+            self._maybe_heartbeat()
             if not keyword:
                 continue
             audio_ts = float(ts) + len(frame) / float(self.sample_rate)
@@ -928,32 +1067,197 @@ class Tap:
                 log.exception("kws: player did not close")
 
 
+FIX_PACKAGE = "uv sync --extra kws"
+FIX_MODEL = "audi27 kws download"
+_reported: set[str] = set()
+
+
+def _configured_input(cfg) -> str:
+    device = cfg.audio.device
+    if device in ("", None):
+        return "default"
+    return str(device)
+
+
+def input_device_name(cfg) -> str:
+    """Capture device name. A missing PortAudio falls back to the config value."""
+    label = _configured_input(cfg)
+    try:
+        import sounddevice as sd
+        spec = None if cfg.audio.device in ("", None) else cfg.audio.device
+        info = sd.query_devices(spec, "input")
+    except Exception:
+        return label
+    name = info.get("name") if isinstance(info, dict) else None
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return label
+
+
+def player_view(player) -> dict:
+    empty = {"backend": "", "device": "", "stream": ""}
+    if player is None:
+        return empty
+    status = getattr(player, "status", None)
+    if not callable(status):
+        return empty
+    try:
+        view = status()
+    except Exception:
+        return empty
+    if not isinstance(view, dict):
+        return empty
+    backend = view.get("backend")
+    device = view.get("device")
+    stream = view.get("stream")
+    return {
+        "backend": backend if isinstance(backend, str) else "",
+        "device": device if isinstance(device, str) else "",
+        "stream": stream if isinstance(stream, str) else "",
+    }
+
+
+def status_report(cfg, *, state: str, reason: str = "", fix: str = "", player=None,
+                  input_device: str | None = None) -> dict:
+    """Startup snapshot. `state` is `live` or `disabled`. Does not write."""
+    view = player_view(player)
+    name = input_device_name(cfg) if input_device is None else input_device
+    live = state == "live"
+    return {
+        "enabled": bool(cfg.kws.enabled),
+        "live": live,
+        "state": "live" if live else "disabled",
+        "reason": "" if live else reason,
+        "fix": "" if live else fix,
+        "model_dir": cfg.kws.model_dir,
+        "keywords": keyword_lines(cfg.kws.keywords),
+        "threshold": float(cfg.kws.threshold),
+        "score": float(cfg.kws.score),
+        "sample_rate": int(cfg.audio.sample_rate),
+        "input_device": name,
+        "output_device": view["device"],
+        "player": view["backend"],
+    }
+
+
+def format_status(report: dict) -> str:
+    keywords = report.get("keywords") or []
+    keys = " ".join(str(item) for item in keywords) if keywords else "-"
+    output = report.get("output_device") or "-"
+    player = report.get("player") or "-"
+    detail = (
+        f"model_dir={report.get('model_dir')} keywords={keys} "
+        f"threshold={report.get('threshold')} score={report.get('score')} "
+        f"input={report.get('input_device')} {report.get('sample_rate')} Hz "
+        f"output={output} player={player}"
+    )
+    if report.get("state") == "live":
+        return f"kws live {detail}"
+    fix = report.get("fix") or ""
+    reason = report.get("reason") or "disabled"
+    if fix:
+        return f"kws disabled: {reason}. Fix: {fix} {detail}"
+    return f"kws disabled: {reason}. {detail}"
+
+
+def _status_data(report: dict) -> dict:
+    keywords = report.get("keywords") or []
+    return {
+        "enabled": bool(report.get("enabled")),
+        "live": bool(report.get("live")),
+        "state": report.get("state") or "disabled",
+        "reason": report.get("reason") or "",
+        "fix": report.get("fix") or "",
+        "model_dir": str(report.get("model_dir") or ""),
+        "keywords": [str(item) for item in keywords],
+        "threshold": float(report.get("threshold") or 0),
+        "score": float(report.get("score") or 0),
+        "sample_rate": int(report.get("sample_rate") or 0),
+        "input_device": str(report.get("input_device") or ""),
+        "output_device": str(report.get("output_device") or ""),
+        "player": str(report.get("player") or ""),
+    }
+
+
+def emit_status(data_dir, report: dict) -> None:
+    """One `kws_status` event. ERROR when the spotter was asked for and is not live."""
+    level = logging.ERROR if report.get("enabled") and not report.get("live") else logging.INFO
+    log.log(level, "%s", format_status(report))
+    try:
+        event = make_event(
+            "kws_status", KWS_SOURCE, _status_data(report),
+            id=f"kws-status-{time.time_ns()}")
+    except Exception:
+        log.exception("kws: status event was not built")
+        return
+    _write_event(data_dir, event)
+
+
+def heartbeat_line(stats: dict) -> str:
+    rtf = stats.get("rtf")
+    rtf_s = "-" if rtf is None else f"{float(rtf):.3f}"
+    lag = stats.get("lag_s")
+    lag_s = "-" if lag is None else f"{float(lag):.3f}"
+    return (
+        f"kws heartbeat frames={stats.get('frames', 0)} dropped={stats.get('dropped', 0)} "
+        f"rtf={rtf_s} lag_s={lag_s} hits={stats.get('hits', 0)} "
+        f"stream={stats.get('stream') or '-'} device={stats.get('output_device') or '-'} "
+        f"player={stats.get('player') or '-'}"
+    )
+
+
+def _unavailable(text: str, model_dir: str, *, model_present: bool) -> tuple[str, str]:
+    if not model_present:
+        return f"model not found in {model_dir}", FIX_MODEL
+    low = (text or "").lower()
+    if "not installed" in low or "no module" in low or "sherpa" in low:
+        return "sherpa-onnx is not installed", FIX_PACKAGE
+    if text:
+        return text, ""
+    return "sherpa-onnx is not installed", FIX_PACKAGE
+
+
+def _report_once(cfg, data_dir, *, reason: str, fix: str) -> None:
+    key = f"{reason}|{fix}|{cfg.kws.model_dir}"
+    if key in _reported:
+        return
+    _reported.add(key)
+    emit_status(data_dir, status_report(cfg, state="disabled", reason=reason, fix=fix))
+
+
 def open_tap(cfg, data_dir, *, engine=None, player=None):
     """Start the spotter thread, or return None when it should stay off.
 
-    A missing model or a missing sherpa-onnx install logs once and returns None.
-    The recorder keeps running.
+    A missing model or a missing sherpa-onnx install logs one ERROR (the fix
+    command) and one `kws_status`, then returns None. The recorder keeps running.
+    `[kws] enabled = false` writes nothing here; `audi27 run` records that itself.
     """
     if not cfg.kws.enabled:
         return None
     if engine is None:
         files = find_model(cfg.kws.model_dir)
         if files is None:
-            _warn_once(
-                f"kws disabled: model not found in {cfg.kws.model_dir}. Run: audi27 kws download")
+            reason, fix = _unavailable("", cfg.kws.model_dir, model_present=False)
+            _report_once(cfg, data_dir, reason=reason, fix=fix)
             return None
         try:
             engine = load_engine(cfg, files)
         except KwsError as e:
-            _warn_once(f"kws disabled: {e}")
+            reason, fix = _unavailable(str(e), cfg.kws.model_dir, model_present=True)
+            _report_once(cfg, data_dir, reason=reason, fix=fix)
             return None
         except Exception:
-            _warn_once(f"kws disabled: spotter failed to load from {cfg.kws.model_dir}")
             log.exception("kws: spotter failed to load")
+            _report_once(
+                cfg, data_dir,
+                reason=f"spotter failed to load from {cfg.kws.model_dir}", fix="")
             return None
     if player is None:
         player = build_player(cfg)
-    log.info("kws watching %s", ", ".join(cfg.kws.keywords))
+    try:
+        emit_status(data_dir, status_report(cfg, state="live", player=player))
+    except Exception:
+        log.exception("kws: status event was not written")
     return Tap(cfg, data_dir, engine, player, start=True)
 
 

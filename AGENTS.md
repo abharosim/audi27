@@ -42,7 +42,7 @@ Transcripts are speech recognition output: names, numbers and mixed Chinese/Engl
 
 Later modules talk only through `data/events/YYYY-MM-DD.jsonl` (one JSON object per line, local date). `data/transcripts/` stays the source of truth for what was said. Each transcript record is also copied to an `utterance` event; `audi27 events backfill` copies transcripts that were written before the stream existed.
 
-Fixed fields: `id`, `ts` (ISO 8601 with a timezone offset), `type`, `source`, `ref` (id of the event that caused this one, or null), `data` (object). Known types: `utterance`, `screen`, `presence`, `turn`, `route`, `task`, `reply`, `brief`, `spoken`, `confirm`, `cue_played`, `wake`. Any other type is valid — do not reject a type you do not recognise.
+Fixed fields: `id`, `ts` (ISO 8601 with a timezone offset), `type`, `source`, `ref` (id of the event that caused this one, or null), `data` (object). Known types: `utterance`, `screen`, `presence`, `turn`, `route`, `task`, `reply`, `brief`, `spoken`, `confirm`, `cue_played`, `cue_decision`, `wake`, `kws_status`. Any other type is valid — do not reject a type you do not recognise.
 
 ```bash
 uv run audi27 events replay --since 2h --type utterance
@@ -114,6 +114,10 @@ uv run audi27 kws test dada.wav --keyword-end 0.6
 ```
 
 Turn `[kws] enabled` on in config.toml. The recorder picks it up on the next `audi27 run` or supervise restart. Leave `[cue] enabled` on as well if a trigger the spotter misses should still ding from the transcript. With the model missing, `kws.live` is never written and the text cue behaves as before.
+
+`audi27 run` writes one `kws_status` at startup (INFO). When `[kws] enabled` is true but sherpa-onnx or the model is missing, that line is ERROR and names the fix (`uv sync --extra kws` or `audi27 kws download`). `./start.sh` passes `--extra kws` to `uv sync` when `config.toml` has `[kws] enabled = true`, because `uv sync --extra dev` alone uninstalls the extra. While the spotter is live it refreshes `data/kws.live` with frames, dropped frames, realtime factor, lag, hits, and player state, and logs that at INFO every `[kws] heartbeat_s` (default 60). A hit's `wake` includes `latency_s` (wall time since that frame was captured), `play_ok`, `play_device`, and `play_error`. Logging stays off the capture callback; the heartbeat line and the events go through the existing writer thread.
+
+`cue` writes a `cue_decision` for every utterance that contains a `[turns]` trigger anywhere: `played`, or `skipped` with reason `trigger not at start so no turn`, `spotter live and a wake covered it`, `status not ok`, `dedup`, or `player error`. An utterance with no trigger writes no decision. `audi27 doctor` prints the flags, whether sherpa-onnx imports, whether the model is on disk, `kws.live`, the last wake / cue_played / cue_decision / kws_status events, and the last kws/cue warnings from `data/audi27.log`.
 
 ## Routes
 

@@ -241,6 +241,13 @@ class Pipeline:
                 kws_tap = open_tap(self.cfg, self.store.root)
             except Exception:
                 log.exception("kws did not start")
+        else:
+            try:
+                from .kws import emit_status, status_report
+                emit_status(self.store.root, status_report(
+                    self.cfg, state="disabled", reason="[kws] enabled = false"))
+            except Exception:
+                log.exception("kws status was not written")
 
         def beat(stopped: bool = False) -> None:
             try:

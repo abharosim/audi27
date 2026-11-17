@@ -130,6 +130,94 @@ def test_unknown_keyword_is_skipped(caplog, monkeypatch):
 # --- hit, debounce, events ---------------------------------------------------
 
 
+def test_a_hit_logs_latency_keyword_and_play_result(tmp_path, caplog):
+    def play():
+        return {"ok": True, "backend": "sounddevice", "sound": "tone", "device": "Speakers", "error": ""}
+
+    tap, _cfg = _tap(tmp_path, play)
+    caplog.set_level(logging.INFO)
+    captured = time.time() - 0.25
+    assert tap.handle("达达", captured) is True
+    wake = list(replay(tmp_path, types="wake"))[0]["data"]
+    assert wake["keyword"] == "达达"
+    assert wake["latency_s"] == pytest.approx(0.25, abs=0.15)
+    assert wake["play_ok"] is True
+    assert wake["play_device"] == "Speakers"
+    assert wake["play_error"] == ""
+    assert "达达" in caplog.text and "Speakers" in caplog.text and "ok" in caplog.text
+
+
+def test_a_failed_play_records_the_error_on_the_wake(tmp_path, caplog):
+    def play():
+        return {
+            "ok": False, "backend": "log", "sound": "tone", "device": "",
+            "error": "output stream did not start",
+        }
+
+    tap, _cfg = _tap(tmp_path, play)
+    caplog.set_level(logging.INFO)
+    assert tap.handle("达达", time.time()) is True
+    wake = list(replay(tmp_path, types="wake"))[0]["data"]
+    assert wake["play_ok"] is False
+    assert wake["play_error"] == "output stream did not start"
+    assert "output stream did not start" in caplog.text
+
+
+def test_heartbeat_logs_counters_and_refreshes_the_live_file(tmp_path, caplog):
+    class Player:
+        def play(self):
+            return {"ok": True, "backend": "mock", "sound": "tone", "device": "Speakers"}
+
+        def status(self):
+            return {"backend": "mock", "device": "Speakers", "stream": "open"}
+
+        def close(self):
+            return None
+
+    tap, cfg = _tap(tmp_path, Player())
+    cfg.kws.heartbeat_s = 60
+    tap.frames = 40
+    tap.dropped = 3
+    tap.decode_s = 0.4
+    tap.audio_s = 20.0
+    tap.hits = 2
+    tap.lag_s = 0.08
+    tap._heartbeat_at = 1_000.0
+    caplog.set_level(logging.INFO)
+    tap._maybe_heartbeat(now=1_030.0)
+    assert "heartbeat" not in caplog.text
+    tap._maybe_heartbeat(now=1_060.0)
+    assert "frames=40" in caplog.text
+    assert "dropped=3" in caplog.text
+    assert "hits=2" in caplog.text
+    assert "open" in caplog.text
+    live = json.loads((Path(tmp_path) / "kws.live").read_text(encoding="utf-8"))
+    assert live["frames"] == 40 and live["dropped"] == 3 and live["hits"] == 2
+    assert live["rtf"] == pytest.approx(0.02)
+    assert live["lag_s"] == pytest.approx(0.08)
+    assert live["stream"] == "open" and live["output_device"] == "Speakers"
+    assert "pid" in live and "updated" in live and "started" in live
+
+
+def test_the_worker_counts_frames_without_logging_each_one(tmp_path, caplog):
+    class Engine:
+        def accept(self, _samples, _rate):
+            return None
+
+    caplog.set_level(logging.INFO)
+    tap, cfg = _tap(tmp_path, _player([]), engine=Engine(), start=True)
+    cfg.kws.heartbeat_s = 3600
+    for i in range(4):
+        tap.offer(np.zeros(480, np.int16), 1_700_000_000.0 + i * 0.03)
+    deadline = time.time() + 2
+    while time.time() < deadline and tap.frames < 4:
+        time.sleep(0.02)
+    tap.close()
+    assert tap.frames == 4
+    assert tap.dropped == 0
+    assert [rec for rec in caplog.records if rec.name == "audi27.kws" and "heartbeat" in rec.message] == []
+
+
 def test_a_hit_plays_and_writes_wake_and_cue(tmp_path):
     calls = []
     tap, _cfg = _tap(tmp_path, _player(calls))
@@ -279,8 +367,10 @@ def test_the_hit_does_not_wait_for_the_event_write(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
-def test_player_reopens_when_the_stream_stops_or_the_device_changes():
+def test_player_reopens_when_the_stream_stops_or_the_device_changes(caplog):
     from audi27.kws import SoundDevicePlayer, tone
+
+    caplog.set_level(logging.INFO)
 
     class Stream:
         def __init__(self):
@@ -313,18 +403,25 @@ def test_player_reopens_when_the_stream_stops_or_the_device_changes():
     backend = Backend()
     player = SoundDevicePlayer(tone(880, 80), 16000, "tone", backend=backend)
     assert backend.opens == 1
+    assert "output stream open" in caplog.text and "speakers" in caplog.text
+    assert player.status()["stream"] == "open" and player.status()["device"] == "speakers"
     assert player.play()["ok"] is True and player.play()["backend"] == "sounddevice"
+    assert player.play()["device"] == "speakers"
     assert backend.opens == 1
     backend.streams[0].active = False
     assert player.play()["ok"] is True
     assert backend.opens == 2
+    assert "stream stopped" in caplog.text
     backend.device = "headphones"
     assert player.play()["ok"] is True
     assert backend.opens == 3
+    assert "headphones" in caplog.text
     backend.fail = True
     backend.streams[-1].active = False
     missed = player.play()
     assert missed["ok"] is False and missed["backend"] == "log"
+    assert missed["error"]
+    assert any(rec.levelno >= logging.ERROR and "did not start" in rec.message for rec in caplog.records)
     backend.fail = False
     assert player.play()["ok"] is True
     assert backend.opens == 5
@@ -392,12 +489,80 @@ def test_missing_model_disables_the_spotter_and_logs_once(tmp_path, caplog):
     cfg = C.Config()
     cfg.kws.enabled = True
     cfg.kws.model_dir = str(tmp_path / "no-model")
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.DEBUG)
     assert open_tap(cfg, tmp_path) is None
     assert open_tap(cfg, tmp_path) is None
-    msgs = [rec.message for rec in caplog.records if rec.name == "audi27.kws"]
-    assert len(msgs) == 1
-    assert "disabled" in msgs[0] and "no-model" in msgs[0]
+    errors = [rec for rec in caplog.records if rec.name == "audi27.kws" and rec.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "disabled" in errors[0].message and "no-model" in errors[0].message
+    assert "audi27 kws download" in errors[0].message
+    rows = list(replay(tmp_path, types="kws_status"))
+    assert len(rows) == 1
+    data = rows[0]["data"]
+    assert data["enabled"] is True and data["live"] is False and data["state"] == "disabled"
+    assert data["fix"] == "audi27 kws download"
+    assert "no-model" in data["reason"]
+    assert "kws_status" in KNOWN_TYPES
+
+
+def test_missing_sherpa_logs_the_install_command(tmp_path, caplog, monkeypatch):
+    cfg = C.Config()
+    cfg.kws.enabled = True
+    cfg.kws.model_dir = str(tmp_path / "model")
+    monkeypatch.setattr(
+        "audi27.kws.find_model",
+        lambda _d: {"tokens": tmp_path, "encoder": tmp_path, "decoder": tmp_path, "joiner": tmp_path})
+
+    def boom(_cfg, _files, module=None):
+        raise KwsError("sherpa-onnx is not installed (uv sync --extra kws)")
+
+    monkeypatch.setattr("audi27.kws.load_engine", boom)
+    caplog.set_level(logging.ERROR)
+    assert open_tap(cfg, tmp_path) is None
+    assert any(
+        rec.levelno >= logging.ERROR and "uv sync --extra kws" in rec.message
+        for rec in caplog.records if rec.name == "audi27.kws")
+    data = list(replay(tmp_path, types="kws_status"))[0]["data"]
+    assert data["enabled"] is True and data["live"] is False
+    assert data["fix"] == "uv sync --extra kws"
+    assert "sherpa-onnx is not installed" in data["reason"]
+
+
+def test_open_tap_records_a_live_status(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr("audi27.kws.input_device_name", lambda _cfg: "Test Mic")
+    cfg = C.Config()
+    cfg.kws.enabled = True
+
+    class Engine:
+        def accept(self, _samples, _rate):
+            return None
+
+    class Player:
+        def play(self):
+            return {"ok": True, "backend": "sounddevice", "sound": "tone", "device": "Speakers"}
+
+        def status(self):
+            return {"backend": "sounddevice", "device": "Speakers", "stream": "open"}
+
+        def close(self):
+            return None
+
+    caplog.set_level(logging.INFO)
+    tap = open_tap(cfg, tmp_path, engine=Engine(), player=Player())
+    assert tap is not None
+    tap.close()
+    infos = [rec.message for rec in caplog.records if rec.name == "audi27.kws" and rec.levelno == logging.INFO]
+    assert any("live" in msg and "Test Mic" in msg and "16000" in msg and "d á d á" in msg for msg in infos)
+    data = list(replay(tmp_path, types="kws_status"))[0]["data"]
+    assert data["live"] is True and data["state"] == "live" and data["enabled"] is True
+    assert data["input_device"] == "Test Mic"
+    assert data["sample_rate"] == 16000
+    assert data["output_device"] == "Speakers"
+    assert data["player"] == "sounddevice"
+    assert data["threshold"] == 0.25 and data["score"] == 1.5
+    assert data["model_dir"] == cfg.kws.model_dir
+    assert any(line.startswith("d á d á") for line in data["keywords"])
+    assert data["fix"] == "" and data["reason"] == ""
 
 
 def test_disabled_flag_does_not_log(tmp_path, caplog):
@@ -534,6 +699,8 @@ def test_text_cue_plays_when_kws_is_enabled_but_the_spotter_is_not_live(tmp_path
     assert ack(data, cfg, _utterance("u-wake", "达达，今天天气", TS), player=player, pending={}) is True
     assert calls == [cfg.cue.sound]
     assert [ev["id"] for ev in replay(data, types="cue_played")] == ["cue-u-wake"]
+    decision = list(replay(data, types="cue_decision"))
+    assert [row["data"]["reason"] for row in decision] == ["played"]
 
 
 def test_a_live_spotter_skips_the_text_cue_only_when_a_wake_covers_the_utterance(tmp_path):
@@ -566,6 +733,8 @@ def test_a_live_spotter_skips_the_text_cue_only_when_a_wake_covers_the_utterance
     assert ack(data, cfg, missed, player=player, pending={}) is True
     assert calls == [cfg.cue.sound]
     assert [ev["ref"] for ev in replay(data, types="cue_played") if ev["source"] == "cue"] == ["u-da"]
+    reasons = [ev["data"]["reason"] for ev in replay(data, types="cue_decision")]
+    assert reasons == ["spotter live and a wake covered it", "played"]
 
 
 def test_a_stale_or_dead_spotter_does_not_silence_the_text_cue(tmp_path):
@@ -607,6 +776,7 @@ def test_config_defaults_and_example_document_kws():
     assert cfg.kws.threshold == 0.25
     assert cfg.kws.score == 1.5
     assert cfg.kws.debounce_ms == 1500
+    assert cfg.kws.heartbeat_s == 60
     assert cfg.kws.tone_hz == 880
     assert cfg.kws.tone_ms == 80
     assert cfg.kws.sound == ""
@@ -619,13 +789,16 @@ def test_config_defaults_and_example_document_kws():
     body = text.split("[kws]", 1)[1].split("\n[", 1)[0]
     assert "enabled = false" in body
     assert "keywords" in body and "threshold" in body and "debounce_ms" in body
+    assert "heartbeat_s" in body
+    assert example.kws.heartbeat_s == 60
 
 
 def test_config_rejects_a_bad_kws_section(tmp_path):
     path = tmp_path / "c.toml"
-    path.write_text('[kws]\nenabled = true\nkeywords = ["达达"]\nthreshold = 0.2\nscore = 0\n', encoding="utf-8")
+    path.write_text('[kws]\nenabled = true\nkeywords = ["达达"]\nthreshold = 0.2\nscore = 0\nheartbeat_s = 30\n', encoding="utf-8")
     loaded = C.load(path)
     assert loaded.kws.enabled is True and loaded.kws.threshold == 0.2 and loaded.kws.score == 0
+    assert loaded.kws.heartbeat_s == 30
     for bad in (
         "[kws]\nenabled = \"yes\"\n",
         "[kws]\nkeywords = []\n",
@@ -633,6 +806,7 @@ def test_config_rejects_a_bad_kws_section(tmp_path):
         "[kws]\nthreshold = 2\n",
         "[kws]\nscore = -1\n",
         "[kws]\ndebounce_ms = -5\n",
+        "[kws]\nheartbeat_s = 0\n",
         "[kws]\nnope = 1\n",
     ):
         path.write_text(bad, encoding="utf-8")
@@ -736,8 +910,51 @@ def test_missing_model_leaves_transcription_running(tmp_path, monkeypatch, caplo
     Pipeline(cfg, [FakeT()], store).run()
     assert search(store.root, ["hello"])
     assert list(replay(store.root, types="wake")) == []
-    assert any("disabled" in rec.message and "absent-model" in rec.message
+    assert any(rec.levelno >= logging.ERROR and "disabled" in rec.message and "absent-model" in rec.message
+               and "audi27 kws download" in rec.message
                for rec in caplog.records if rec.name == "audi27.kws")
+    status = list(replay(store.root, types="kws_status"))
+    assert len(status) == 1 and status[0]["data"]["fix"] == "audi27 kws download"
+
+
+def test_a_disabled_spotter_still_writes_a_startup_status(tmp_path, monkeypatch, caplog):
+    import audi27.capture as capture
+    from audi27.pipeline import Pipeline
+    from audi27.store import Store
+    from audi27.transcribers import Transcriber
+
+    class FakeT(Transcriber):
+        name = "fake"
+        model = "m"
+
+        def transcribe(self, wav, language=None, prompt=None):
+            raise AssertionError("no speech in this clip")
+
+    class FakeCapture:
+        dropped_frames = overflows = 0
+
+        def __init__(self, _cfg):
+            pass
+
+        def frames(self, _stop):
+            yield np.zeros(480, np.int16), 1_700_000_000.0
+
+    monkeypatch.setattr(capture, "Capture", FakeCapture)
+    caplog.set_level(logging.INFO)
+    cfg = C.Config()
+    cfg.correct.enabled = False
+    cfg.kws.enabled = False
+    store = Store(tmp_path / "rec", "none")
+    Pipeline(cfg, [FakeT()], store).run()
+    rows = list(replay(store.root, types="kws_status"))
+    assert len(rows) == 1
+    assert rows[0]["data"]["enabled"] is False
+    assert rows[0]["data"]["live"] is False
+    assert rows[0]["data"]["state"] == "disabled"
+    assert "enabled = false" in rows[0]["data"]["reason"]
+    assert any(rec.levelno == logging.INFO and "enabled = false" in rec.message
+               for rec in caplog.records if rec.name == "audi27.kws")
+    assert not any(rec.levelno >= logging.ERROR and rec.name == "audi27.kws" for rec in caplog.records)
 
 
 def test_spotter_does_not_block_the_capture_loop(tmp_path, monkeypatch):

@@ -114,8 +114,10 @@ sound = "/System/Library/Sounds/Tink.aiff"
 # package missing, or the process has stopped) and the text cue keeps working.
 # Turns and routes are unchanged: Whisper text still decides the command.
 # `audi27 kws download` fetches the model into model_dir (not committed).
-# If the package or the model is missing, one log line and the spotter stays
-# off; transcription keeps going. Install with `uv sync --extra kws`.
+# If the package or the model is missing, one ERROR and a kws_status event,
+# and the spotter stays off; transcription keeps going. Install with
+# `uv sync --extra kws`. start.sh adds that extra when enabled is true here,
+# because `uv sync --extra dev` alone uninstalls it.
 # keywords: 达达 / 哒哒 / 大大 / dada become `d á d á @<word>`. A sherpa line
 # is also accepted (`d á d á :2 #0.4 @达达`). threshold is the trigger
 # probability (higher fires less often). score boosts the keyword in beam
@@ -131,6 +133,7 @@ sound = ""
 tone_hz = 880
 tone_ms = 80
 debounce_ms = 1500
+heartbeat_s = 60        # INFO counters while the spotter is live; kws.live carries the same stats
 
 # Intent router. Display only: it writes `route` events and never messages an agent.
 # Rules are routes.toml if that file exists, otherwise routes.example.toml, re-read every turn.

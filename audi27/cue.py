@@ -11,7 +11,9 @@ keeps running. A play appends `cue_played` (`ref` = the utterance id). That
 window is the same kind of self-speech as a TTS read-back: a bare yes/no whose
 audio starts inside it is ignored. The first start does not replay history
 (`data/cue.cursor.json`). `[cue] enabled` only decides whether `audi27 supervise`
-starts this loop; `cue run` plays either way.
+starts this loop; `cue run` plays either way. An utterance that contains a
+trigger anywhere also gets one `cue_decision` (played, or why it was skipped).
+Speech with no trigger writes nothing.
 
 When the keyword spotter is actually running (`data/kws.live` is fresh and
 its pid is alive), a transcript whose audio time already has a `wake` event
@@ -142,6 +144,47 @@ def playback_windows(events) -> list[tuple[datetime, datetime]]:
     return windows
 
 
+def trigger_in_text(text, triggers) -> tuple[str | None, bool]:
+    """`(surface, at_start)` when `text` contains a trigger, else `(None, False)`.
+
+    `at_start` uses the same rule as a turn: only a trigger that would open one.
+    A later occurrence (今天达达) still counts, so a skipped ding can be explained.
+    大大小小 and dadapple contain the letters and are not triggers.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None, False
+    at = match_trigger(text, triggers)
+    if at:
+        return at, True
+    i = 0
+    while i < len(text):
+        hit = match_trigger(text[i:], triggers)
+        if hit:
+            return hit, False
+        i += 1
+    return None, False
+
+
+def classify_utterance(event, triggers) -> dict | None:
+    """A decision input, or None when the utterance has no trigger at all."""
+    if not isinstance(event, dict) or event.get("type") != "utterance":
+        return None
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    text = data.get("text")
+    surface, at_start = trigger_in_text(text if isinstance(text, str) else "", triggers)
+    if surface is None:
+        return None
+    status = data.get("status")
+    ident = event.get("id")
+    return {
+        "trigger": surface,
+        "at_start": at_start,
+        "status": status if isinstance(status, str) else "",
+        "status_ok": status in ("ok", "suspect"),
+        "id": ident if isinstance(ident, str) else "",
+    }
+
+
 def wake_trigger(event: dict, triggers) -> str | None:
     """Surface form when `event` would open a turn, otherwise None.
 
@@ -198,6 +241,27 @@ def _flush(data_dir, pending: dict, ident: str) -> bool:
     return True
 
 
+def _emit_decision(data_dir, utt_id: str, info: dict, action: str, reason: str) -> None:
+    log.info(
+        "cue decision %s %s trigger=%s reason=%s",
+        utt_id or "-", action, info.get("trigger") or "", reason)
+    if not isinstance(utt_id, str) or not utt_id or any(c.isspace() for c in utt_id):
+        return
+    try:
+        event = make_event(
+            "cue_decision", CUE_SOURCE,
+            {
+                "action": action,
+                "reason": reason,
+                "trigger": info.get("trigger") or "",
+                "status": info.get("status") or "",
+            },
+            ref=utt_id, id="cuedec-" + utt_id)
+        append(data_dir, event)
+    except Exception:
+        log.exception("cue decision was not written for %s", utt_id)
+
+
 def ack(data_dir, cfg, utterance: dict, *, player, pending: dict) -> bool:
     """Play the cue for one wake utterance and append `cue_played`.
 
@@ -208,22 +272,45 @@ def ack(data_dir, cfg, utterance: dict, *, player, pending: dict) -> bool:
     A live keyword spotter that already wrote a `wake` for this utterance
     is skipped, so the same wake does not ding twice. The spotter being
     configured but not running does not suppress the ding.
+
+    An utterance that contains a trigger anywhere gets one `cue_decision`.
+    Speech with no trigger does not. A retry of a failed `cue_played` write
+    does not write a second decision.
     """
-    trigger = wake_trigger(utterance, cfg.turns.triggers)
-    if trigger is None:
+    info = classify_utterance(utterance, cfg.turns.triggers)
+    if info is None:
+        return True
+    utt_id = info["id"]
+
+    def emit(action: str, reason: str) -> None:
+        _emit_decision(data_dir, utt_id, info, action, reason)
+
+    if not info["status_ok"]:
+        emit("skipped", f"status not ok ({info['status'] or 'missing'})")
+        return True
+    if not info["at_start"]:
+        emit("skipped", "trigger not at start so no turn")
+        return True
+    if not utt_id or any(c.isspace() for c in utt_id):
         return True
     if _spotter_already_dinged(data_dir, utterance):
+        emit("skipped", "spotter live and a wake covered it")
         return True
-    utt_id = utterance["id"]
     ident = "cue-" + utt_id
     if ident in pending:
         return _flush(data_dir, pending, ident)
     if _already(data_dir, ident):
+        emit("skipped", "dedup")
         return True
+    trigger = info["trigger"]
     sound = cfg.cue.sound
     # Stamp the window before starting playback so the beep itself falls inside it.
     started = datetime.now().astimezone()
     result = _outcome(player, sound)
+    if result["ok"]:
+        emit("played", "played")
+    else:
+        emit("skipped", "player error")
     data = {
         "sound": sound,
         "backend": result["backend"],

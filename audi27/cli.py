@@ -415,6 +415,14 @@ def cmd_cue(args, cfg) -> int:
     return 0
 
 
+def cmd_doctor(args, cfg) -> int:
+    from .doctor import render
+
+    data_dir = getattr(args, "data_dir", None) or cfg.store.data_dir
+    print(render(cfg, data_dir, limit=max(1, int(args.limit))), flush=True)
+    return 0
+
+
 def cmd_kws(args, cfg) -> int:
     from .kws import KwsError, download_model, find_model, format_report, report_file
 
@@ -610,6 +618,10 @@ def main(argv=None) -> int:
                     help="seconds from the start of the file to the end of the keyword")
     kt.add_argument("--json", action="store_true")
     kw.set_defaults(fn=cmd_kws)
+    doc = sub.add_parser("doctor", help="one-screen summary of the wake-word ding")
+    doc.add_argument("--data-dir")
+    doc.add_argument("--limit", type=int, default=5, help="how many recent wake/cue lines to print")
+    doc.set_defaults(fn=cmd_doctor)
     sc = sub.add_parser("screen", help="record the frontmost app and window title")
     scsub = sc.add_subparsers(dest="screen_cmd", required=True)
     scrun = scsub.add_parser("run", help="sample the front window and emit screen events on change")
