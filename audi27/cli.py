@@ -415,6 +415,35 @@ def cmd_cue(args, cfg) -> int:
     return 0
 
 
+def cmd_kws(args, cfg) -> int:
+    from .kws import KwsError, download_model, find_model, format_report, report_file
+
+    if args.kws_cmd == "download":
+        dest = Path(args.dir) if getattr(args, "dir", None) else Path(cfg.kws.model_dir)
+        try:
+            before = find_model(dest) is not None
+            path = download_model(dest)
+        except KwsError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        print(f"{'present' if before else 'downloaded'}: {path}")
+        return 0
+    wav = Path(args.wav)
+    if not wav.is_file():
+        print(f"error: file not found: {wav}", file=sys.stderr)
+        return 2
+    try:
+        report = report_file(wav, cfg, keyword_end=getattr(args, "keyword_end", None))
+    except KwsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False))
+    else:
+        print(format_report(report))
+    return 0 if report.get("detected_s") is not None else 1
+
+
 def cmd_screen(args, cfg) -> int:
     from .screen import serve
 
@@ -571,6 +600,16 @@ def main(argv=None) -> int:
     crun.add_argument("--data-dir")
     crun.add_argument("--poll", type=float, default=0.2, help="seconds between polls")
     cu.set_defaults(fn=cmd_cue)
+    kw = sub.add_parser("kws", help="streaming wake-word spotter on the capture stream")
+    kwsub = kw.add_subparsers(dest="kws_cmd", required=True)
+    dl = kwsub.add_parser("download", help="download the keyword model into the model directory")
+    dl.add_argument("--dir", help="model directory (default: [kws] model_dir)")
+    kt = kwsub.add_parser("test", help="run the spotter on a wav and print detection latency")
+    kt.add_argument("wav")
+    kt.add_argument("--keyword-end", type=float, default=None,
+                    help="seconds from the start of the file to the end of the keyword")
+    kt.add_argument("--json", action="store_true")
+    kw.set_defaults(fn=cmd_kws)
     sc = sub.add_parser("screen", help="record the frontmost app and window title")
     scsub = sc.add_subparsers(dest="screen_cmd", required=True)
     scrun = scsub.add_parser("run", help="sample the front window and emit screen events on change")

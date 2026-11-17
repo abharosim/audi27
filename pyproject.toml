@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+kws = ["sherpa-onnx>=1.10", "pypinyin>=0.51"]
 
 [project.scripts]
 audi27 = "audi27.cli:main"

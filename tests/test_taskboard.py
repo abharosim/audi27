@@ -313,7 +313,10 @@ def test_dashboard_serves_the_task_section(tmp_path):
     from audi27.web import make_server
 
     data = tmp_path / "data"
-    append(data, task("route-1", "running", "帮我记一下", RUNNING_AT, adapter="fake", target="muse"))
+    # The dashboard only replays yesterday and today, so the fixture has to sit
+    # on the clock the server actually uses.
+    now = datetime.now().astimezone().isoformat()
+    append(data, task("route-1", "running", "帮我记一下", now, adapter="fake", target="muse"))
     server = make_server(data, port=0)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()

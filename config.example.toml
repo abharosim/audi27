@@ -104,6 +104,34 @@ wall_close_s = 8.0      # live mode: idle after the last utterance is seen, then
 enabled = false
 sound = "/System/Library/Sounds/Tink.aiff"
 
+# Streaming wake word on the same microphone frames `audi27 run` already
+# captures. Default off. It does not open a second input and it does not wait
+# for the VAD segment or for Whisper. A hit plays a tone immediately and
+# writes a `wake` event (audio time + keyword) plus `cue_played`, so confirm
+# still ignores the ding. A running spotter writes data/kws.live. The text
+# cue then skips a trigger only when a wake already sits on that utterance,
+# so a homophone the model missed still dings. No live file (model or
+# package missing, or the process has stopped) and the text cue keeps working.
+# Turns and routes are unchanged: Whisper text still decides the command.
+# `audi27 kws download` fetches the model into model_dir (not committed).
+# If the package or the model is missing, one log line and the spotter stays
+# off; transcription keeps going. Install with `uv sync --extra kws`.
+# keywords: 达达 / 哒哒 / 大大 / dada become `d á d á @<word>`. A sherpa line
+# is also accepted (`d á d á :2 #0.4 @达达`). threshold is the trigger
+# probability (higher fires less often). score boosts the keyword in beam
+# search. sound empty = 880 Hz, 80 ms sine via sounddevice. debounce_ms is
+# the audio-clock gap before another hit can ring.
+[kws]
+enabled = false
+keywords = ["达达", "哒哒", "大大", "DaDa", "dada", "Dada"]
+threshold = 0.25
+score = 1.5
+model_dir = "data/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+sound = ""
+tone_hz = 880
+tone_ms = 80
+debounce_ms = 1500
+
 # Intent router. Display only: it writes `route` events and never messages an agent.
 # Rules are routes.toml if that file exists, otherwise routes.example.toml, re-read every turn.
 # `enabled` also starts `audi27 route run` under `audi27 supervise` / start.sh. Default off.

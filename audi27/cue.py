@@ -12,6 +12,11 @@ window is the same kind of self-speech as a TTS read-back: a bare yes/no whose
 audio starts inside it is ignored. The first start does not replay history
 (`data/cue.cursor.json`). `[cue] enabled` only decides whether `audi27 supervise`
 starts this loop; `cue run` plays either way.
+
+When the keyword spotter is actually running (`data/kws.live` is fresh and
+its pid is alive), a transcript whose audio time already has a `wake` event
+does not play again. A trigger the spotter did not catch, and every trigger
+while the spotter is down, still plays.
 """
 from __future__ import annotations
 
@@ -200,9 +205,14 @@ def ack(data_dir, cfg, utterance: dict, *, player, pending: dict) -> bool:
     and the next poll tries the write again. The sound is not played twice:
     `pending` remembers an id whose append failed. An id already stored is
     not played again. Anything that would not open a turn is ignored.
+    A live keyword spotter that already wrote a `wake` for this utterance
+    is skipped, so the same wake does not ding twice. The spotter being
+    configured but not running does not suppress the ding.
     """
     trigger = wake_trigger(utterance, cfg.turns.triggers)
     if trigger is None:
+        return True
+    if _spotter_already_dinged(data_dir, utterance):
         return True
     utt_id = utterance["id"]
     ident = "cue-" + utt_id
@@ -234,6 +244,22 @@ def ack(data_dir, cfg, utterance: dict, *, player, pending: dict) -> bool:
     else:
         log.info("cue not played for %s", utt_id)
     return _flush(data_dir, pending, ident)
+
+
+def _spotter_already_dinged(data_dir, utterance: dict) -> bool:
+    """True when a live spotter's `wake` already covers this utterance.
+
+    Any failure here plays the text cue. Silence is worse than a second ding
+    when the check itself is broken.
+    """
+    try:
+        from .kws import spotter_live, wake_covers
+        if not spotter_live(data_dir):
+            return False
+        return wake_covers(data_dir, utterance)
+    except Exception:
+        log.exception("kws liveness check failed")
+        return False
 
 
 def play_once(cfg, *, player=None) -> dict:

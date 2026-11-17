@@ -4,8 +4,10 @@
 `[speak] enabled`, `[confirm] enabled`, `[screen] enabled`, and `[cue] enabled`
 add those processes.
 All default off. `[presence] enabled` does not add one: the recorder publishes
-`data/presence.json` itself, and only when that flag is on. A child that exits is
-started again on its own (1 s -> 30 s backoff). When data/restart.request appears,
+`data/presence.json` itself, and only when that flag is on. `[kws] enabled`
+does not add one either: the recorder spots the wake word on the frames it
+already has. A child that exits is started again on its own (1 s -> 30 s backoff).
+When data/restart.request appears,
 every child is stopped cleanly and the supervisor re-executes itself, so a code
 change (including to this file) is picked up. data/supervisor.json records pid,
 start time, and restart count.

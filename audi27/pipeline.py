@@ -231,6 +231,16 @@ class Pipeline:
             if self.cfg.presence.enabled else None
         )
         presence_error = False
+        # Keyword spotting reads the same frames. The callback has already
+        # returned; offer() only enqueues, and the model runs on its own thread.
+        kws_tap = None
+        kws_error = False
+        if self.cfg.kws.enabled:
+            from .kws import open_tap
+            try:
+                kws_tap = open_tap(self.cfg, self.store.root)
+            except Exception:
+                log.exception("kws did not start")
 
         def beat(stopped: bool = False) -> None:
             try:
@@ -256,6 +266,13 @@ class Pipeline:
                         warned_zero = True
                 else:
                     zero_since, warned_zero = None, False
+                if kws_tap is not None:
+                    try:
+                        kws_tap.offer(frame, ts)
+                    except Exception:
+                        if not kws_error:
+                            log.exception("kws offer failed")
+                            kws_error = True
                 s = seg.feed(frame, ts)
                 if publisher is not None:
                     try:
@@ -283,6 +300,11 @@ class Pipeline:
             log.info("stopping")
         finally:
             self.stop.set()
+            if kws_tap is not None:
+                try:
+                    kws_tap.close()
+                except Exception:
+                    log.exception("kws did not stop")
             if publisher is not None:
                 try:
                     publisher.close()
