@@ -520,11 +520,11 @@ def test_missing_sherpa_logs_the_install_command(tmp_path, caplog, monkeypatch):
     caplog.set_level(logging.ERROR)
     assert open_tap(cfg, tmp_path) is None
     assert any(
-        rec.levelno >= logging.ERROR and "uv sync --extra kws" in rec.message
+        rec.levelno >= logging.ERROR and "uv sync --extra dev --extra kws" in rec.message
         for rec in caplog.records if rec.name == "audi27.kws")
     data = list(replay(tmp_path, types="kws_status"))[0]["data"]
     assert data["enabled"] is True and data["live"] is False
-    assert data["fix"] == "uv sync --extra kws"
+    assert data["fix"] == "uv sync --extra dev --extra kws"
     assert "sherpa-onnx is not installed" in data["reason"]
 
 

@@ -44,8 +44,28 @@ def _stop(procs: dict, grace: float) -> None:
             p.wait()
 
 
+def uv_sync_command(config_path: str | None = None) -> list[str]:
+    """`uv sync` for a restart. Keeps the kws extra when `[kws] enabled` is true.
+
+    `uv sync --extra dev` alone uninstalls every other extra, including sherpa-onnx.
+    The flag is read with the config loader. A missing file is the default
+    (spotter off). A config that does not parse is logged and synced without kws.
+    """
+    from .config import ConfigError, load
+
+    argv = ["uv", "sync", "--extra", "dev"]
+    try:
+        cfg = load(config_path) if config_path else load()
+    except ConfigError as e:
+        log.error("config was not read (%s); syncing without the kws extra", e)
+        return argv
+    if cfg.kws.enabled:
+        argv.extend(["--extra", "kws"])
+    return argv
+
+
 def supervise(data_dir: str | Path, specs: dict[str, list[str]], reexec, poll_s: float = 1.0,
-              grace_s: float = 90.0) -> None:
+              grace_s: float = 90.0, *, config_path: str | None = None) -> None:
     root = Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     trigger = root / "restart.request"
@@ -99,8 +119,9 @@ def supervise(data_dir: str | Path, specs: dict[str, list[str]], reexec, poll_s:
                 log.info("restart requested: %s", reason or "(no reason given)")
                 _stop(procs, grace_s)
                 if pyproject.exists() and pyproject.stat().st_mtime != deps_mtime and shutil.which("uv"):
-                    log.info("pyproject.toml changed; running uv sync")
-                    subprocess.run(["uv", "sync", "--extra", "dev"], cwd=PROJECT)
+                    cmd = uv_sync_command(config_path)
+                    log.info("pyproject.toml changed; running %s", " ".join(cmd))
+                    subprocess.run(cmd, cwd=PROJECT)
                 os.environ["AUDI27_RESTARTS"] = str(restarts + 1)
                 os.environ["AUDI27_RESTART_REASON"] = reason
                 reexec()
@@ -146,4 +167,4 @@ def main(config_path: str | None, data_dir: str, host: str, port: int, *, turns:
                         screen=screen, cue=cue)
     argv = [sys.executable, "-m", "audi27.cli"] + (["-c", config_path] if config_path else [])
     argv += ["supervise", "--host", host, "--port", str(port)]
-    supervise(data_dir, specs, lambda: os.execv(sys.executable, argv))
+    supervise(data_dir, specs, lambda: os.execv(sys.executable, argv), config_path=config_path)

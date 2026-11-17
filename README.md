@@ -118,7 +118,7 @@ uv run audi27 cue run
 模型不进仓库。需要额外依赖：
 
 ```bash
-uv sync --extra kws          # sherpa-onnx 和 pypinyin
+uv sync --extra dev --extra kws   # sherpa-onnx 和 pypinyin；只写 --extra kws 会卸掉 dev
 uv run audi27 kws download   # 约 31 MB，放到 [kws] model_dir
 ```
 
@@ -152,7 +152,7 @@ uv run audi27 kws test dada.wav
 uv run audi27 kws test dada.wav --keyword-end 0.6
 ```
 
-要听到模型没抓住的触发词，把 `[cue] enabled` 也开着。模型还没下好就打开 `[kws]` 时，只有文本提示音会响。`audi27 run` 写一条 `kws_status`：开着但没装上时是 ERROR，并写明修复命令（`uv sync --extra kws` 或 `audi27 kws download`）。`./start.sh` 看到 `config.toml` 里 `[kws] enabled = true` 会执行 `uv sync --extra dev --extra kws`，避免每次启动把 sherpa-onnx 卸掉。它不会因为这个开关多拉起进程，检测活在 `audi27 run` 里面。改完配置后 `touch data/restart.request` 让守护进程重新拉起录音。
+要听到模型没抓住的触发词，把 `[cue] enabled` 也开着。模型还没下好就打开 `[kws]` 时，只有文本提示音会响。`audi27 run` 写一条 `kws_status`：开着但没装上时是 ERROR，并写明修复命令（`uv sync --extra dev --extra kws` 或 `audi27 kws download`）。`./start.sh` 看到 `config.toml` 里 `[kws] enabled = true` 会执行 `uv sync --extra dev --extra kws`，避免每次启动把 sherpa-onnx 卸掉。它不会因为这个开关多拉起进程，检测活在 `audi27 run` 里面。改完配置后 `touch data/restart.request` 让守护进程重新拉起录音。
 
 检测线程大约每秒把计数写进 `data/kws.live`（帧数、丢掉的帧、实时因子、延迟、命中次数、播放流状态），每 `heartbeat_s`（默认 60 秒）打一行 INFO。命中的 `wake` 带 `latency_s`（从这一帧采集到检出）、`play_ok`、`play_device`、`play_error`。文本提示音对**句中任何位置**出现触发词的 utterance 写一条 `cue_decision`（响了，或为什么跳过）。完全没有触发词的不写。
 
@@ -164,7 +164,7 @@ uv run audi27 doctor
 
 先看这一屏，再看 `data/audi27.log` 里 `audi27.kws` / `audi27.cue` 的 ERROR 和 WARNING。
 
-- `kws disabled: sherpa-onnx is not installed. Fix: uv sync --extra kws`：单独跑 `uv sync --extra dev` 会卸掉 kws。`./start.sh` 只在 `[kws] enabled = true` 时保留它。
+- `kws disabled: sherpa-onnx is not installed. Fix: uv sync --extra dev --extra kws`：单独跑 `uv sync --extra dev` 或单独的 `--extra kws` 都会卸掉另一个 extra。`./start.sh` 只在 `[kws] enabled = true` 时两个都保留。
 - `Fix: audi27 kws download`：模型目录是空的。
 - `cue decision … trigger not at start so no turn`：句里有「达达」，但不在句首，不会开一轮，也不响。
 - `spotter live and a wake covered it`：模型已经响过，文本提示音不再响第二次。
@@ -276,7 +276,7 @@ uv run audi27 eval list
 echo "改了什么" > data/restart.request
 ```
 
-守护进程每秒检查一次这个文件：先让录音进程把最后一段写完再退出，`pyproject.toml` 变了就先 `uv sync`，
+守护进程每秒检查一次这个文件：先让录音进程把最后一段写完再退出，`pyproject.toml` 变了就先 `uv sync --extra dev`（`[kws] enabled = true` 时再加 `--extra kws`），
 然后重新执行自己，所以所有代码改动（包括守护进程本身）都会生效。`data/supervisor.json` 记录 pid、启动时间和重启次数。
 
 ## 屏幕上下文

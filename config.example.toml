@@ -116,7 +116,7 @@ sound = "/System/Library/Sounds/Tink.aiff"
 # `audi27 kws download` fetches the model into model_dir (not committed).
 # If the package or the model is missing, one ERROR and a kws_status event,
 # and the spotter stays off; transcription keeps going. Install with
-# `uv sync --extra kws`. start.sh adds that extra when enabled is true here,
+# `uv sync --extra dev --extra kws`. start.sh adds the kws extra when enabled is true here,
 # because `uv sync --extra dev` alone uninstalls it.
 # keywords: 达达 / 哒哒 / 大大 / dada become `d á d á @<word>`. A sherpa line
 # is also accepted (`d á d á :2 #0.4 @达达`). threshold is the trigger

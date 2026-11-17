@@ -564,7 +564,7 @@ def load_engine(cfg, files: dict, *, module=None):
         try:
             import sherpa_onnx as sherpa
         except ImportError as e:
-            raise KwsError("sherpa-onnx is not installed (uv sync --extra kws)") from e
+            raise KwsError("sherpa-onnx is not installed (uv sync --extra dev --extra kws)") from e
     lines = keyword_lines(cfg.kws.keywords)
     if not lines:
         raise KwsError("no keyword could be encoded")
@@ -1067,7 +1067,7 @@ class Tap:
                 log.exception("kws: player did not close")
 
 
-FIX_PACKAGE = "uv sync --extra kws"
+FIX_PACKAGE = "uv sync --extra dev --extra kws"
 FIX_MODEL = "audi27 kws download"
 _reported: set[str] = set()
 

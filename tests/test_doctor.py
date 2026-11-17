@@ -36,7 +36,7 @@ def test_doctor_summarizes_config_live_stats_events_and_warnings(tmp_path):
         ref="u-ok", id="cue-u-ok"))
     (data / "audi27.log").write_text(
         "2026-11-17 10:00:00,000 INFO audi27.kws: kws live\n"
-        "2026-11-17 10:00:01,000 ERROR audi27.kws: kws disabled: sherpa-onnx is not installed. Fix: uv sync --extra kws\n"
+        "2026-11-17 10:00:01,000 ERROR audi27.kws: kws disabled: sherpa-onnx is not installed. Fix: uv sync --extra dev --extra kws\n"
         "2026-11-17 10:00:02,000 WARNING audi27.cue: cue: sound file missing: /tmp/nope.aiff\n"
         "2026-11-17 10:00:03,000 INFO audi27.cue: cue decision u-ok played trigger=达达 reason=played\n",
         encoding="utf-8")
@@ -45,7 +45,7 @@ def test_doctor_summarizes_config_live_stats_events_and_warnings(tmp_path):
     assert "kws enabled: true" in text
     assert "cue enabled: false" in text
     assert "sherpa-onnx: not importable" in text
-    assert "uv sync --extra kws" in text
+    assert "uv sync --extra dev --extra kws" in text
     assert "audi27 kws download" in text
     assert "frames=12" in text and "dropped=1" in text and "hits=3" in text
     assert "fresh" in text and "Speakers" in text

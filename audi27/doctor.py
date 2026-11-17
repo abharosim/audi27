@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .events import replay
-from .kws import find_model, keyword_lines, read_live, spotter_live
+from .kws import FIX_PACKAGE, find_model, keyword_lines, read_live, spotter_live
 
 
 def sherpa_status() -> tuple[bool, str]:
@@ -128,7 +128,7 @@ def render(cfg, data_dir, *, limit: int = 5, now: float | None = None,
         f"input_device: {input_device}",
     ]
     if cfg.kws.enabled and not ok:
-        lines.append("fix: uv sync --extra kws")
+        lines.append(f"fix: {FIX_PACKAGE}")
     if cfg.kws.enabled and model is None:
         lines.append("fix: audi27 kws download")
     lines.append(_live_line(root, float(now)))
