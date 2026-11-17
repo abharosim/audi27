@@ -5,6 +5,7 @@ Nothing here opens a microphone or a sound device.
 import io
 import json
 import logging
+import os
 import tarfile
 import time
 import wave
@@ -115,6 +116,10 @@ def test_pypinyin_matches_the_sherpa_ppinyin_lines():
     assert keyword_line("女儿") == "n ǚ ér @女儿"
 
 
+def test_identical_pronunciations_keep_the_first_spelling():
+    assert keyword_lines(["达达", "哒哒", "dada", "DaDa"]) == ["d á d á @达达"]
+
+
 def test_unknown_keyword_is_skipped(caplog, monkeypatch):
     monkeypatch.setattr("audi27.kws._to_syllables", lambda _text: None)
     caplog.set_level(logging.WARNING)
@@ -211,15 +216,16 @@ def test_the_kws_cue_window_hides_a_bare_yes_and_a_later_yes_counts(tmp_path):
     assert [ev["data"]["decision"] for ev in heard] == ["approve"]
 
 
-def test_offer_drops_when_the_queue_is_full_and_returns_immediately(tmp_path):
+def test_offer_drops_the_oldest_frame_and_returns_immediately(tmp_path):
     calls = []
     tap, _cfg = _tap(tmp_path, _player(calls), start=False, queue_size=1)
-    frame = np.zeros(480, np.int16)
-    tap.offer(frame, 0.0)
+    tap.offer(np.zeros(480, np.int16), 0.0)
     started = time.monotonic()
-    tap.offer(frame, 1.0)
+    tap.offer(np.full(480, 3, np.int16), 1.0)
     assert time.monotonic() - started < 0.05
     assert tap.dropped == 1
+    kept_frame, kept_ts = tap.q.get_nowait()
+    assert kept_ts == 1.0 and int(kept_frame[0]) == 3
     assert calls == []
 
 
@@ -237,6 +243,92 @@ def test_the_worker_plays_once_for_a_burst(tmp_path):
     assert len(calls) == 1
     assert len(list(replay(tmp_path, types="wake"))) == 1
     assert len(list(replay(tmp_path, types="cue_played"))) == 1
+
+
+def test_a_running_spotter_publishes_kws_live_and_clears_it_on_close(tmp_path):
+    from audi27.kws import spotter_live
+
+    calls = []
+    tap, _cfg = _tap(tmp_path, _player(calls), engine=None, start=True)
+    deadline = time.time() + 2
+    while time.time() < deadline and not spotter_live(tmp_path):
+        time.sleep(0.02)
+    assert spotter_live(tmp_path) is True
+    tap.close()
+    assert not (Path(tmp_path) / "kws.live").exists()
+    assert spotter_live(tmp_path) is False
+
+
+def test_the_hit_does_not_wait_for_the_event_write(tmp_path, monkeypatch):
+    import audi27.kws as kws_mod
+
+    real = kws_mod.append
+
+    def slow(data_dir, event, if_absent=False):
+        time.sleep(0.2)
+        return real(data_dir, event, if_absent=if_absent)
+
+    monkeypatch.setattr(kws_mod, "append", slow)
+    calls = []
+    tap, _cfg = _tap(tmp_path, _player(calls), engine=None, start=True)
+    started = time.monotonic()
+    assert tap.handle("达达", 1_700_000_000.0) is True
+    assert time.monotonic() - started < 0.1
+    tap.close()
+    assert [ev["data"]["keyword"] for ev in replay(tmp_path, types="wake")] == ["达达"]
+    assert len(calls) == 1
+
+
+def test_player_reopens_when_the_stream_stops_or_the_device_changes():
+    from audi27.kws import SoundDevicePlayer, tone
+
+    class Stream:
+        def __init__(self):
+            self.active = True
+
+        def stop(self):
+            self.active = False
+
+        def close(self):
+            self.active = False
+
+    class Backend:
+        def __init__(self):
+            self.device = "speakers"
+            self.opens = 0
+            self.fail = False
+            self.streams = []
+
+        def output_device(self):
+            return self.device
+
+        def open_stream(self, _callback, _rate):
+            self.opens += 1
+            if self.fail:
+                raise RuntimeError("device gone")
+            stream = Stream()
+            self.streams.append(stream)
+            return stream
+
+    backend = Backend()
+    player = SoundDevicePlayer(tone(880, 80), 16000, "tone", backend=backend)
+    assert backend.opens == 1
+    assert player.play()["ok"] is True and player.play()["backend"] == "sounddevice"
+    assert backend.opens == 1
+    backend.streams[0].active = False
+    assert player.play()["ok"] is True
+    assert backend.opens == 2
+    backend.device = "headphones"
+    assert player.play()["ok"] is True
+    assert backend.opens == 3
+    backend.fail = True
+    backend.streams[-1].active = False
+    missed = player.play()
+    assert missed["ok"] is False and missed["backend"] == "log"
+    backend.fail = False
+    assert player.play()["ok"] is True
+    assert backend.opens == 5
+    player.close()
 
 
 # --- model -------------------------------------------------------------------
@@ -413,7 +505,21 @@ def test_read_wav_roundtrip(tmp_path):
 # --- text cue ----------------------------------------------------------------
 
 
-def test_text_cue_stays_quiet_when_kws_is_on(tmp_path):
+def _utterance(ident, text, start, end=None):
+    end = start if end is None else end
+    return make_event("utterance", "transcribe", {
+        "id": ident, "text": text, "status": "ok", "start": start, "end": end,
+    }, ts=start, id=ident)
+
+
+def _mark_live(data, *, updated, pid=None):
+    root = Path(data)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {"pid": os.getpid() if pid is None else pid, "started": updated, "updated": updated}
+    (root / "kws.live").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_text_cue_plays_when_kws_is_enabled_but_the_spotter_is_not_live(tmp_path):
     from audi27.cue import ack
 
     data = tmp_path / "data"
@@ -425,12 +531,69 @@ def test_text_cue_stays_quiet_when_kws_is_on(tmp_path):
         calls.append(sound)
         return {"ok": True, "backend": "mock", "sound": sound}
 
-    utterance = make_event("utterance", "transcribe", {
-        "id": "u-wake", "text": "达达，今天天气", "status": "ok", "start": TS, "end": TS,
-    }, ts=TS, id="u-wake")
-    assert ack(data, cfg, utterance, player=player, pending={}) is True
-    assert calls == []
-    assert list(replay(data, types="cue_played")) == []
+    assert ack(data, cfg, _utterance("u-wake", "达达，今天天气", TS), player=player, pending={}) is True
+    assert calls == [cfg.cue.sound]
+    assert [ev["id"] for ev in replay(data, types="cue_played")] == ["cue-u-wake"]
+
+
+def test_a_live_spotter_skips_the_text_cue_only_when_a_wake_covers_the_utterance(tmp_path):
+    from audi27.cue import ack
+    from audi27.kws import wake_covers
+    from audi27.store import _dt
+
+    data = tmp_path / "data"
+    cfg = C.Config()
+    cfg.kws.enabled = True
+    cfg.turns.triggers = ["达达", "搭搭"]
+    calls = []
+
+    def player(sound):
+        calls.append(sound)
+        return {"ok": True, "backend": "mock", "sound": sound}
+
+    start = datetime.fromisoformat(TS)
+    _mark_live(data, updated=time.time())
+    wake_at = start.timestamp()
+    from audi27.events import append
+    append(data, make_event("wake", "kws", {"keyword": "达达", "audio_ts": wake_at},
+                            ts=_dt(wake_at), id="wake-covered"))
+    covered = _utterance("u-dada", "达达，今天天气", TS, "2026-11-15T12:00:02+00:00")
+    assert wake_covers(data, covered) is True
+    assert ack(data, cfg, covered, player=player, pending={}) is True
+    # 搭搭 is a turns trigger the default spotter list does not contain.
+    missed = _utterance("u-da", "搭搭，记一下", "2026-11-15T12:00:20+00:00", "2026-11-15T12:00:22+00:00")
+    assert wake_covers(data, missed) is False
+    assert ack(data, cfg, missed, player=player, pending={}) is True
+    assert calls == [cfg.cue.sound]
+    assert [ev["ref"] for ev in replay(data, types="cue_played") if ev["source"] == "cue"] == ["u-da"]
+
+
+def test_a_stale_or_dead_spotter_does_not_silence_the_text_cue(tmp_path):
+    from audi27.cue import ack
+    from audi27.kws import spotter_live
+    from audi27.store import _dt
+
+    data = tmp_path / "data"
+    cfg = C.Config()
+    calls = []
+
+    def player(sound):
+        calls.append(sound)
+        return {"ok": True, "backend": "mock", "sound": sound}
+
+    said = _utterance("u-wake", "达达，今天天气", TS)
+    wake_at = datetime.fromisoformat(TS).timestamp()
+    from audi27.events import append
+    append(data, make_event("wake", "kws", {"keyword": "达达", "audio_ts": wake_at},
+                            ts=_dt(wake_at), id="wake-old"))
+    _mark_live(data, updated=time.time() - 30)
+    assert spotter_live(data) is False
+    assert ack(data, cfg, said, player=player, pending={}) is True
+    _mark_live(data, updated=time.time(), pid=2**30)
+    assert spotter_live(data) is False
+    said2 = _utterance("u-wake-2", "达达，再来", "2026-11-15T12:00:05+00:00")
+    assert ack(data, cfg, said2, player=player, pending={}) is True
+    assert calls == [cfg.cue.sound, cfg.cue.sound]
 
 
 # --- config / cli ------------------------------------------------------------
@@ -438,8 +601,9 @@ def test_text_cue_stays_quiet_when_kws_is_on(tmp_path):
 
 def test_config_defaults_and_example_document_kws():
     cfg = C.Config()
+    from audi27.turns import DEFAULT_TRIGGERS
     assert cfg.kws.enabled is False
-    assert cfg.kws.keywords == ["达达"]
+    assert cfg.kws.keywords == list(DEFAULT_TRIGGERS)
     assert cfg.kws.threshold == 0.25
     assert cfg.kws.score == 1.5
     assert cfg.kws.debounce_ms == 1500
@@ -450,7 +614,7 @@ def test_config_defaults_and_example_document_kws():
     root = Path(__file__).resolve().parents[1]
     example = C.load(root / "config.example.toml")
     assert example.kws.enabled is False
-    assert example.kws.keywords == ["达达"]
+    assert example.kws.keywords == list(DEFAULT_TRIGGERS)
     text = (root / "config.example.toml").read_text(encoding="utf-8")
     body = text.split("[kws]", 1)[1].split("\n[", 1)[0]
     assert "enabled = false" in body

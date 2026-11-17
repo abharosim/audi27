@@ -21,12 +21,15 @@ the path aimed at under 400 ms. It does not wait for segment silence or Whisper.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
+import os
 import queue
 import sys
 import tarfile
 import threading
+import time
 import urllib.request
 import wave
 from datetime import datetime, timedelta
@@ -35,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from .cue import SUPPRESS_S
-from .events import append, make_event
+from .events import append, make_event, replay
 from .store import _dt
 
 log = logging.getLogger("audi27.kws")
@@ -47,6 +50,16 @@ MODEL_URL = (
     + MODEL_NAME + ".tar.bz2"
 )
 MODEL_RATE = 16000
+# The recorder refreshes this while the spotter thread is alive. The text cue
+# treats a missing, stale, or dead-pid file as "the spotter is not live".
+LIVE_NAME = "kws.live"
+LIVE_STALE_S = 5.0
+LIVE_TOUCH_S = 1.0
+# A wake covers a transcript when its audio time falls in this margin around
+# the utterance. The spotter fires near the start of the command; the
+# transcript arrives after Whisper, so the window has to include that span.
+WAKE_LEAD_S = 2.0
+WAKE_TAIL_S = 1.0
 # ppinyin: the longest initial wins, so zh/ch/sh come before z/c/s.
 _INITIALS = (
     "zh", "ch", "sh",
@@ -154,13 +167,19 @@ def keyword_line(text: str) -> str | None:
 
 
 def keyword_lines(words) -> list[str]:
+    """Sherpa lines for `words`. Identical pronunciations keep the first spelling."""
     lines = []
+    seen = set()
     for word in words:
         line = keyword_line(word)
         if line is None:
             log.warning(
                 "kws: skipping keyword %r; use a sherpa line such as 'd á d á @达达'", word)
             continue
+        tokens = line.split("@", 1)[0].strip()
+        if tokens in seen:
+            continue
+        seen.add(tokens)
         lines.append(line)
     return lines
 
@@ -312,29 +331,21 @@ class _LogPlayer:
         return None
 
 
-class SoundDevicePlayer:
-    """An output stream that is already running. `play` only rewinds a buffer."""
+class _SoundDeviceBackend:
+    """The real output device. Tests pass their own backend with the same two methods."""
 
-    def __init__(self, pcm: np.ndarray, sample_rate: int, label: str):
-        self.pcm = np.ascontiguousarray(pcm, dtype=np.float32)
-        self.sample_rate = sample_rate
-        self.label = label
-        self._lock = threading.Lock()
-        self._pos = None
-        self.stream = None
-        self._ok = False
+    def output_device(self):
+        import sounddevice as sd
         try:
-            import sounddevice as sd
-            self.stream = self._open(sd)
-            self._ok = True
+            return sd.default.device[1]
         except Exception:
-            log.warning("kws: output stream did not start; hits will be logged")
-            self.stream = None
+            return sd.default.device
 
-    def _open(self, sd):
+    def open_stream(self, callback, sample_rate: int):
+        import sounddevice as sd
         kwargs = dict(
-            samplerate=self.sample_rate, channels=1, dtype="float32",
-            callback=self._on_audio, blocksize=128,
+            samplerate=sample_rate, channels=1, dtype="float32",
+            callback=callback, blocksize=128,
         )
         try:
             stream = sd.OutputStream(latency="low", **kwargs)
@@ -343,28 +354,34 @@ class SoundDevicePlayer:
         stream.start()
         return stream
 
-    def _on_audio(self, outdata, frames, _time_info, _status) -> None:
-        outdata.fill(0)
-        with self._lock:
-            if self._pos is None:
-                return
-            n = min(frames, len(self.pcm) - self._pos)
-            if n > 0:
-                outdata[:n, 0] = self.pcm[self._pos:self._pos + n]
-            self._pos += n
-            if self._pos >= len(self.pcm):
-                self._pos = None
 
-    def play(self) -> dict:
-        if not self._ok:
-            return {"ok": False, "backend": "log", "sound": self.label}
-        with self._lock:
-            self._pos = 0
-        return {"ok": True, "backend": "sounddevice", "sound": self.label}
+class SoundDevicePlayer:
+    """A preloaded buffer on an output stream that is already running.
 
-    def close(self) -> None:
+    `play` rewinds that buffer. If the stream has stopped, the callback saw a
+    hard error, or the default output device changed, the next `play` opens a
+    new stream before rewinding. The buffer stays in memory either way, so a
+    healthy hit does not rebuild the tone. A failed reopen is logged and the
+    following hit tries again.
+    """
+
+    def __init__(self, pcm: np.ndarray, sample_rate: int, label: str, *, backend=None):
+        self.pcm = np.ascontiguousarray(pcm, dtype=np.float32)
+        self.sample_rate = sample_rate
+        self.label = label
+        self.backend = backend if backend is not None else _SoundDeviceBackend()
+        self._lock = threading.Lock()
+        self._pos = None
+        self.stream = None
+        self._device = None
+        self._broken = False
+        self._ok = False
+        self._reopen()
+
+    def _close_stream(self) -> None:
         stream = self.stream
         self.stream = None
+        self._ok = False
         if stream is None:
             return
         try:
@@ -372,6 +389,62 @@ class SoundDevicePlayer:
             stream.close()
         except Exception:
             log.exception("kws: output stream did not close")
+
+    def _reopen(self) -> bool:
+        self._close_stream()
+        try:
+            device = self.backend.output_device()
+            self.stream = self.backend.open_stream(self._on_audio, self.sample_rate)
+        except Exception:
+            log.warning("kws: output stream did not start; the next hit will try again")
+            self.stream = None
+            self._device = None
+            self._broken = False
+            self._ok = False
+            return False
+        self._device = device
+        self._broken = False
+        self._ok = True
+        return True
+
+    def _healthy(self) -> bool:
+        stream = self.stream
+        if stream is None or self._broken or not self._ok:
+            return False
+        if getattr(stream, "active", True) is False:
+            return False
+        try:
+            device = self.backend.output_device()
+        except Exception:
+            return True
+        return device == self._device
+
+    def _on_audio(self, outdata, frames, _time_info, _status) -> None:
+        # `_status` is an underflow/overflow flag. A stopped or unplugged device
+        # shows up as `stream.active` is false, which the next `play` reopens.
+        try:
+            outdata.fill(0)
+            with self._lock:
+                if self._pos is None:
+                    return
+                n = min(frames, len(self.pcm) - self._pos)
+                if n > 0:
+                    outdata[:n, 0] = self.pcm[self._pos:self._pos + n]
+                self._pos += n
+                if self._pos >= len(self.pcm):
+                    self._pos = None
+        except Exception:
+            self._broken = True
+
+    def play(self) -> dict:
+        if not self._healthy() and not self._reopen():
+            return {"ok": False, "backend": "log", "sound": self.label}
+        with self._lock:
+            self._pos = 0
+        return {"ok": True, "backend": "sounddevice", "sound": self.label}
+
+    def close(self) -> None:
+        self._close_stream()
 
 
 def build_player(cfg):
@@ -495,6 +568,196 @@ def _write_event(data_dir, event) -> bool:
     return False
 
 
+def _put_drop_oldest(q: queue.Queue, item) -> int:
+    """Enqueue `item`. A full queue drops the oldest item that is not a shutdown sentinel.
+
+    Returns how many items were dropped. A sentinel `(None, ...)` or `None` is put back.
+    """
+    dropped = 0
+    while True:
+        try:
+            q.put_nowait(item)
+            return dropped
+        except queue.Full:
+            try:
+                old = q.get_nowait()
+            except queue.Empty:
+                continue
+            if old is None or (isinstance(old, tuple) and old and old[0] is None):
+                try:
+                    q.put_nowait(old)
+                except queue.Full:
+                    pass
+                return dropped
+            dropped += 1
+
+
+def write_live(data_dir, started: float, *, updated: float | None = None) -> None:
+    """Atomically replace `kws.live`. Readers see the previous file or this one."""
+    root = Path(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "started": float(started),
+        "updated": float(time.time() if updated is None else updated),
+    }
+    tmp = root / (LIVE_NAME + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, root / LIVE_NAME)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def clear_live(data_dir) -> None:
+    try:
+        (Path(data_dir) / LIVE_NAME).unlink(missing_ok=True)
+    except OSError:
+        log.exception("kws live file was not removed")
+
+
+def _pid_alive(pid: int) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def spotter_live(data_dir, *, now: float | None = None, stale_s: float = LIVE_STALE_S) -> bool:
+    """True when `kws.live` was refreshed recently by a process that is still running.
+
+    A missing file, a stale `updated`, a timestamp in the future, or a dead pid
+    means the spotter is not live. The text cue then keeps playing.
+    """
+    now = time.time() if now is None else float(now)
+    path = Path(data_dir) / LIVE_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    updated = data.get("updated")
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+        return False
+    if updated > now + 2 or now - float(updated) > stale_s:
+        return False
+    pid = data.get("pid")
+    if pid is not None and not _pid_alive(pid):
+        return False
+    return True
+
+
+def _epoch(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
+    return dt.timestamp()
+
+
+def _wake_epoch(event: dict) -> float | None:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    found = _epoch(data.get("audio_ts"))
+    if found is not None:
+        return found
+    return _epoch(event.get("ts"))
+
+
+def wake_covers(data_dir, utterance: dict, *, lead_s: float = WAKE_LEAD_S,
+                tail_s: float = WAKE_TAIL_S) -> bool:
+    """True when a `wake` event's audio time sits on this utterance.
+
+    The window is `lead_s` before the utterance start through `tail_s` after
+    its end. A wake from a different command, outside that span, does not count.
+    """
+    data = utterance.get("data") if isinstance(utterance.get("data"), dict) else {}
+    start = _epoch(data.get("start") or utterance.get("ts"))
+    if start is None:
+        return False
+    end = _epoch(data.get("end"))
+    if end is None or end < start:
+        end = start
+    for event in replay(data_dir, types="wake"):
+        when = _wake_epoch(event)
+        if when is not None and start - lead_s <= when <= end + tail_s:
+            return True
+    return False
+
+
+class _EventSink:
+    """Writes wake and cue events off the decode thread. `sync` writes in the caller."""
+
+    def __init__(self, data_dir, *, sync: bool):
+        self.data_dir = data_dir
+        self.sync = sync
+        self.q: queue.Queue = queue.Queue(maxsize=64)
+        self.stop = threading.Event()
+        self.thread = None
+        if not sync:
+            self.thread = threading.Thread(target=self._loop, name="audi27-kws-events", daemon=True)
+            self.thread.start()
+
+    def submit(self, events: list) -> None:
+        rows = [event for event in events if event is not None]
+        if not rows:
+            return
+        if self.sync or self.thread is None:
+            for event in rows:
+                _write_event(self.data_dir, event)
+            return
+        _put_drop_oldest(self.q, rows)
+
+    def _loop(self) -> None:
+        while True:
+            if self.stop.is_set() and self.q.empty():
+                break
+            try:
+                item = self.q.get(timeout=0.2)
+            except queue.Empty:
+                if self.stop.is_set():
+                    break
+                continue
+            if item is None:
+                break
+            for event in item:
+                _write_event(self.data_dir, event)
+
+    def close(self) -> None:
+        if self.thread is None:
+            return
+        self.stop.set()
+        try:
+            self.q.put(None, timeout=2)
+        except queue.Full:
+            pass
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            log.warning("kws event writer did not stop")
+
+
 class Tap:
     """Queue plus worker. `offer` never blocks. `handle` is the hit itself."""
 
@@ -513,8 +776,11 @@ class Tap:
         self._failed = False
         self._last_ts = None
         self._drop_logged = 0
+        self._live_started = time.time()
+        self._live_touch = 0.0
         play = getattr(player, "play", None)
         self._play = play if callable(play) else player
+        self.events = _EventSink(data_dir, sync=not start)
         self.thread = threading.Thread(target=self._loop, name="audi27-kws", daemon=True)
         if start:
             self.start()
@@ -526,18 +792,16 @@ class Tap:
         self.thread.start()
 
     def offer(self, frame, ts: float) -> None:
-        """Copy one captured frame onto the spotter queue. A full queue drops the frame."""
+        """Copy one captured frame onto the spotter queue. A full queue drops the oldest frame."""
         if self._closed:
             return
-        try:
-            copied = np.asarray(frame, dtype=np.int16).copy()
-            self.q.put_nowait((copied, float(ts)))
-        except queue.Full:
-            self.dropped += 1
-            if self.dropped == 1 or self.dropped % 200 == 0:
-                if self.dropped != self._drop_logged:
-                    self._drop_logged = self.dropped
-                    log.warning("kws dropped %d frame(s); the spotter is behind", self.dropped)
+        copied = np.asarray(frame, dtype=np.int16).copy()
+        dropped = _put_drop_oldest(self.q, (copied, float(ts)))
+        if dropped:
+            self.dropped += dropped
+            if self.dropped == dropped or self.dropped // 200 != self._drop_logged // 200:
+                self._drop_logged = self.dropped
+                log.warning("kws dropped %d frame(s); the spotter is behind", self.dropped)
 
     def handle(self, keyword: str, audio_ts: float) -> bool:
         """Play and append `wake` + `cue_played`. False when debounce swallows the hit."""
@@ -590,19 +854,31 @@ class Tap:
         except Exception:
             log.exception("kws: cue event was not built")
             cue = None
-        _write_event(self.data_dir, wake)
-        if cue is not None:
-            _write_event(self.data_dir, cue)
+        self.events.submit([wake] if cue is None else [wake, cue])
         if ok:
             log.info("kws hit %s", keyword)
         else:
             log.info("kws hit %s; cue was not played", keyword)
         return True
 
+    def _touch_live(self, force: bool = False) -> None:
+        if self._closed:
+            return
+        now = time.time()
+        if not force and now - self._live_touch < LIVE_TOUCH_S:
+            return
+        self._live_touch = now
+        try:
+            write_live(self.data_dir, self._live_started)
+        except OSError:
+            log.exception("kws live file was not written")
+
     def _loop(self) -> None:
+        self._touch_live(force=True)
         while True:
             if self.stop.is_set() and self.q.empty():
                 break
+            self._touch_live()
             try:
                 frame, ts = self.q.get(timeout=0.2)
             except queue.Empty:
@@ -642,6 +918,8 @@ class Tap:
             self.thread.join(timeout=5)
             if self.thread.is_alive():
                 log.warning("kws worker did not stop")
+        self.events.close()
+        clear_live(self.data_dir)
         closer = getattr(self.player, "close", None)
         if closer is not None:
             try:

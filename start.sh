@@ -12,8 +12,9 @@
 # `[cue] enabled` (default off) starts `audi27 cue run`: a short sound as soon as
 # a wake word is heard, before the turn closes and before route or dispatch.
 # `[kws] enabled` (default off) does not start a process. The recorder runs a
-# streaming keyword spotter on the frames it already captured. With that flag
-# on, `cue run` stays quiet so the same wake does not ding twice.
+# streaming keyword spotter on the frames it already captured and writes
+# data/kws.live while that thread is up. `cue run` skips a trigger only when
+# that file is live and a wake event already covers the utterance.
 # To restart after a code change without touching this terminal:  touch data/restart.request
 set -e
 cd "$(dirname "$0")"

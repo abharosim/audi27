@@ -193,6 +193,12 @@ class CueCfg:
     sound: str = "/System/Library/Sounds/Tink.aiff"
 
 
+def _default_kws_keywords() -> list:
+    """The built-in wake spellings. `keyword_lines` drops any that have no pinyin."""
+    from .turns import DEFAULT_TRIGGERS
+    return [item for item in DEFAULT_TRIGGERS if isinstance(item, str) and item.strip()]
+
+
 @dataclass
 class KwsCfg:
     # Inside `audi27 run`, on the frames the recorder already has. Default off.
@@ -200,7 +206,10 @@ class KwsCfg:
     # once and the spotter stays off. While this is true, the text cue does not
     # also play.
     enabled: bool = False
-    keywords: list = field(default_factory=lambda: ["达达"])
+    # Default is the [turns] trigger list. Identical pinyin shares one sherpa
+    # line. A trigger added only under [turns] still dings from the transcript
+    # when the spotter did not already fire.
+    keywords: list = field(default_factory=_default_kws_keywords)
     threshold: float = 0.25   # sherpa keywords_threshold; higher fires less often
     score: float = 1.5        # sherpa keywords_score; higher keeps the keyword in beam search
     model_dir: str = "data/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"

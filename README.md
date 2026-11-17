@@ -126,7 +126,7 @@ uv run audi27 kws download   # 约 31 MB，放到 [kws] model_dir
 ```toml
 [kws]
 enabled = true
-keywords = ["达达"]     # 也接受 sherpa 行： "d á d á @达达"
+keywords = ["达达", "哒哒", "大大", "DaDa", "dada", "Dada"]   # 发音相同，也接受 sherpa 行
 threshold = 0.25        # 越大越不容易触发
 score = 1.5             # 越大越容易留在搜索里
 model_dir = "data/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
@@ -136,9 +136,11 @@ tone_ms = 80
 debounce_ms = 1500      # 同一声里不连响（按音频时间）
 ```
 
-`达达`、`哒哒`、`大大`、`dada`（不区分大小写）都编成同一组音素。其它中文在装了 `pypinyin` 时按同样的方式切；切不了就写成 sherpa 那一行。
+默认关键词就是 `[turns]` 的那几个触发词。`达达`、`哒哒`、`大大`、`dada`（不区分大小写）发音相同，sherpa 文件里只留第一行 `d á d á @达达`。其它中文在装了 `pypinyin` 时按同样的方式切；切不了就写成 sherpa 那一行。只写在 `[turns]` 里、没有写进 `keywords` 的词（比如「搭搭」）不会被模型盯着。
 
-命中后先播放，再追加 `wake`（`ts` 和 `data.audio_ts` 是检出那一帧的音频时间，`data.keyword` 是词）和 `cue_played`（`ref` 指向这条 wake）。确认门照旧丢掉落在这个播放窗口里的「确认 / ok」。`[kws] enabled = true` 时，`cue run` 不再为转写出来的唤醒词响第二声。轮次和路由仍看 Whisper 文本，`wake` 现在只做即时反馈。
+检测线程活着时大约每秒改写 `data/kws.live`（pid、started、updated），退出时删掉。超过 5 秒没更新，或者 pid 已经不在，文本提示音就当检测器没在跑。检测器在跑时，一句转写只有在它的音频时间附近已经有一条 `wake` 才不再响，避免同一声响两次；模型没抓住的同音词仍然由文本提示音来响。模型或 `sherpa-onnx` 缺失时不写这个文件，文本提示音保持原样。
+
+命中后先播放。`wake`（`ts` 和 `data.audio_ts` 是检出那一帧的音频时间，`data.keyword` 是词）和 `cue_played`（`ref` 指向这条 wake）由另一条线程写入，不占解码。确认门照旧丢掉落在这个播放窗口里的「确认 / ok」。输出流预先打开，音调已经在内存里。流停了，或者系统默认输出设备换了，下一次命中会重新打开；这一次打不开就记一条日志，再下一次再试。帧队列满了丢掉最旧的一帧。轮次和路由仍看 Whisper 文本，`wake` 现在只做即时反馈。
 
 延迟大致是：采集帧 30 ms，zipformer 的 chunk-16 约 160 ms，再加一个 trailing blank，播放是已经打开的输出流里下一块（128 个样本，约 8 ms）。关键词说完后到响起，按这个预算大约在 200–400 ms，不再加上 800 ms 静音和 Whisper。在一台 Linux x86 虚拟机上，int8 图的实时因子大约是 0.02（5 秒音频几十毫秒就算完），检测线程跟得上采集，不会把帧丢掉。官方测试音里，关键词在句子还没说完时就已经报出来了（例如 3.5 秒的文件在 1.44 秒检出「朱丽楠」）。
 
@@ -149,7 +151,7 @@ uv run audi27 kws test dada.wav
 uv run audi27 kws test dada.wav --keyword-end 0.6
 ```
 
-打开 `[kws]` 之后，`[cue]` 可以保持 `false`。模型还没下好就打开 `[kws]` 时，两边都不响，日志里会写原因。`./start.sh` 不会因为这个开关多拉起进程，它活在 `audi27 run` 里面。改完配置后 `touch data/restart.request` 让守护进程重新拉起录音。
+要听到模型没抓住的触发词，把 `[cue] enabled` 也开着。模型还没下好就打开 `[kws]` 时，只有文本提示音会响，日志里会写一次原因。`./start.sh` 不会因为这个开关多拉起进程，它活在 `audi27 run` 里面。改完配置后 `touch data/restart.request` 让守护进程重新拉起录音。
 
 ## 意图路由
 

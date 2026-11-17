@@ -108,7 +108,10 @@ sound = "/System/Library/Sounds/Tink.aiff"
 # captures. Default off. It does not open a second input and it does not wait
 # for the VAD segment or for Whisper. A hit plays a tone immediately and
 # writes a `wake` event (audio time + keyword) plus `cue_played`, so confirm
-# still ignores the ding. While this is true, `cue run` does not also ding.
+# still ignores the ding. A running spotter writes data/kws.live. The text
+# cue then skips a trigger only when a wake already sits on that utterance,
+# so a homophone the model missed still dings. No live file (model or
+# package missing, or the process has stopped) and the text cue keeps working.
 # Turns and routes are unchanged: Whisper text still decides the command.
 # `audi27 kws download` fetches the model into model_dir (not committed).
 # If the package or the model is missing, one log line and the spotter stays
@@ -120,7 +123,7 @@ sound = "/System/Library/Sounds/Tink.aiff"
 # the audio-clock gap before another hit can ring.
 [kws]
 enabled = false
-keywords = ["达达"]
+keywords = ["达达", "哒哒", "大大", "DaDa", "dada", "Dada"]
 threshold = 0.25
 score = 1.5
 model_dir = "data/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
