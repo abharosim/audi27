@@ -194,6 +194,23 @@ class CueCfg:
 
 
 @dataclass
+class KwsCfg:
+    # Inside `audi27 run`, on the frames the recorder already has. Default off.
+    # Not a separate process and not a second microphone. A missing model logs
+    # once and the spotter stays off. While this is true, the text cue does not
+    # also play.
+    enabled: bool = False
+    keywords: list = field(default_factory=lambda: ["达达"])
+    threshold: float = 0.25   # sherpa keywords_threshold; higher fires less often
+    score: float = 1.5        # sherpa keywords_score; higher keeps the keyword in beam search
+    model_dir: str = "data/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+    sound: str = ""           # empty = generated tone; otherwise a 16-bit wav
+    tone_hz: float = 880.0
+    tone_ms: int = 80
+    debounce_ms: int = 1500
+
+
+@dataclass
 class TurnsCfg:
     # Live assembler under `audi27 supervise` only when this is true. `turns run` ignores it.
     enabled: bool = False
@@ -214,6 +231,7 @@ class Config:
     correct: CorrectCfg = field(default_factory=CorrectCfg)
     turns: TurnsCfg = field(default_factory=TurnsCfg)
     cue: CueCfg = field(default_factory=CueCfg)
+    kws: KwsCfg = field(default_factory=KwsCfg)
     route: RouteCfg = field(default_factory=RouteCfg)
     dispatch: DispatchCfg = field(default_factory=DispatchCfg)
     fake: FakeCfg = field(default_factory=FakeCfg)
@@ -290,6 +308,7 @@ def _check_turns(cfg: Config) -> None:
 def _check_all(cfg: Config) -> None:
     _check_turns(cfg)
     _check_cue(cfg)
+    _check_kws(cfg)
     _check_route(cfg)
     _check_dispatch(cfg)
     _check_fake(cfg)
@@ -308,6 +327,38 @@ def _check_cue(cfg: Config) -> None:
     if not isinstance(c.sound, str) or not c.sound.strip():
         raise ConfigError("cue.sound must be a file path, e.g. /System/Library/Sounds/Tink.aiff")
     c.sound = c.sound.strip()
+
+
+def _check_kws(cfg: Config) -> None:
+    k = cfg.kws
+    if not isinstance(k.enabled, bool):
+        raise ConfigError("kws.enabled must be true or false")
+    k.keywords = _string_list(k.keywords, "kws.keywords")
+    if not k.keywords:
+        raise ConfigError('kws.keywords must list at least one phrase, e.g. ["达达"]')
+    k.threshold = _as_float(k.threshold, "kws.threshold")
+    if not 0 < k.threshold <= 1:
+        raise ConfigError("kws.threshold must be > 0 and <= 1")
+    k.score = _as_float(k.score, "kws.score")
+    if k.score < 0 or k.score > 20:
+        raise ConfigError("kws.score must be between 0 and 20")
+    if not isinstance(k.model_dir, str) or not k.model_dir.strip():
+        raise ConfigError("kws.model_dir must be a directory path")
+    k.model_dir = k.model_dir.strip()
+    if not isinstance(k.sound, str):
+        raise ConfigError("kws.sound must be a wav path, or empty for the tone")
+    k.sound = k.sound.strip()
+    k.tone_hz = _as_float(k.tone_hz, "kws.tone_hz")
+    if not 100 <= k.tone_hz <= 8000:
+        raise ConfigError("kws.tone_hz must be between 100 and 8000")
+    tone_ms = _as_float(k.tone_ms, "kws.tone_ms")
+    if not 10 <= tone_ms <= 2000:
+        raise ConfigError("kws.tone_ms must be between 10 and 2000")
+    k.tone_ms = int(round(tone_ms))
+    debounce = _as_float(k.debounce_ms, "kws.debounce_ms")
+    if not 0 <= debounce <= 10000:
+        raise ConfigError("kws.debounce_ms must be between 0 and 10000")
+    k.debounce_ms = int(round(debounce))
 
 
 def _check_route(cfg: Config) -> None:
